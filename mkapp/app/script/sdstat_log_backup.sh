@@ -1,6 +1,8 @@
 #!/bin/sh
 
-logpath_src=/mnt/app/log
+# Source dir: rc.sh passes the previous boot's log dir it set aside
+# (/mnt/app/log.prev) and runs this in the background; default is the live dir.
+logpath_src=${1:-/mnt/app/log}
 logpath_dst=/mnt/extsd/log
 
 function log_backup()
@@ -51,6 +53,15 @@ function log_backup()
         done
 }
 
+# Nothing to back up: skip the slow index scan of the SD card's log dir.
+set -- ${logpath_src}/*.log
+if [ ! -e "$1" ]; then
+    if [ "$logpath_src" != "/mnt/app/log" ]; then
+        rm -rf ${logpath_src}
+    fi
+    exit
+fi
+
 #if grep -qs '/mnt/extsd' /proc/mounts; then 
 if df | grep -qs '/mnt/extsd'; then
     echo "sdcard mounted."         
@@ -63,5 +74,9 @@ fi
 log_backup $logpath_src $logpath_dst
 
 #remove all log files
-rm -f ${logpath_src}/*
+if [ "$logpath_src" != "/mnt/app/log" ]; then
+    rm -rf ${logpath_src}
+else
+    rm -f ${logpath_src}/*
+fi
 

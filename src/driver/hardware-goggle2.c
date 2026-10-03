@@ -11,6 +11,7 @@
 #include <log/log.h>
 
 #include "../core/app_state.h"
+#include "../core/boot_timing.h"
 #include "../core/common.hh"
 #include "../core/osd.h"
 #include "../core/settings.h"
@@ -551,7 +552,11 @@ void Display_UI_init() {
     g_hw_stat.source_mode = SOURCE_MODE_UI;
     I2C_Write(ADDR_FPGA, 0x8C, 0x00);
 
-    system_exec("dispw -s vdpo 1080p50");
+    // At boot rc.sh has just set vdpo to 1080p50; every vdpo mode set costs
+    // ~1.1 s in the driver, so the initial bring-up skips the repeat
+    // (hardware-tested). Later calls come from other modes and need it.
+    if (g_init_done)
+        system_exec("dispw -s vdpo 1080p50");
     g_hw_stat.vdpo_tmg = VDPO_TMG_1080P50;
     system_exec("aww 0x0300b340 0x00000008");
     Display_VO_SWITCH(0);
@@ -833,9 +838,11 @@ void Source_AV(bool is_av_in) {
 
     TP2825_Switch_Mode(g_setting.source.analog_format);
     TP2825_Switch_CH(g_hw_stat.is_av_in);
+    boot_mark("av_tp2825");
 
     AV_Mode_Switch_fpga(g_setting.source.analog_format);
     g_hw_stat.av_pal_w = g_setting.source.analog_format;
+    boot_mark("av_mode_switch_fpga");
 
     vclk_phase_set(VIDEO_SOURCE_AV_IN, 0);
     pclk_phase_set(VIDEO_SOURCE_AV_IN);
@@ -843,7 +850,9 @@ void Source_AV(bool is_av_in) {
     I2C_Write(ADDR_FPGA, 0x89, 0x01);
 
     HDZero_Close();
+    boot_mark("av_hdzero_close");
     screen.vtmg(1);
+    boot_mark("av_screen_vtmg");
     I2C_Write(ADDR_FPGA, 0xa7, 0x11);
 
     if (g_setting.source.analog_ratio == SETTING_SOURCES_ANALOG_RATIO_4_3)
@@ -856,6 +865,7 @@ void Source_AV(bool is_av_in) {
     g_hw_stat.source_mode = SOURCE_MODE_AV;
     Display_VO_SWITCH(1);
     screen.display(1);
+    boot_mark("av_display_on");
 
     pthread_mutex_unlock(&hardware_mutex);
 }

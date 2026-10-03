@@ -8,6 +8,7 @@ extern "C" {
 void IT66021_srst();
 void IT66021_close();
 void IT66021_init();
+void IT66021_reset_early();
 int IT66021_Sig_det();
 int IT66021_Get_VTMG(int *freq_ref);
 int IT66021_Get_CS();

@@ -13,6 +13,7 @@
 #include "dm5680.h"
 #include "i2c.h"
 #include "uart.h"
+#include "core/boot_timing.h"
 #include "util/system.h"
 
 #define WAIT(ms) usleep((ms) * 1000)
@@ -1690,12 +1691,14 @@ int DM6302_init(uint8_t freq, uint8_t bw) {
             return 1;
         }
     }
+    boot_mark("dm6302_reset_init0");
 
     DM6302_EFUSE1(1);
     LOGI("EFUSE1 1 done");
 
     DM6302_EFUSE1(2);
     LOGI("EFUSE1 2 done");
+    boot_mark("dm6302_efuse1");
 
     DM6302_Init1(0, bw);
     LOGI("Init1 done");
@@ -1717,6 +1720,7 @@ int DM6302_init(uint8_t freq, uint8_t bw) {
 
     DM6302_Init7(0, bw);
     LOGI("Init7 done");
+    boot_mark("dm6302_init1_7");
 
     DM6302_Init8(0);
     LOGI("Init8 done");
@@ -1738,21 +1742,25 @@ int DM6302_init(uint8_t freq, uint8_t bw) {
 
     DM6302_Init14(0, bw);
     LOGI("Init14 done");
+    boot_mark("dm6302_init8_14");
 
     DM6302_EFUSE2(1);
     LOGI("EFUSE2 1 done");
 
     DM6302_EFUSE2(2);
     LOGI("EFUSE2 2 done");
+    boot_mark("dm6302_efuse2");
 
     DM6302_DCOC(1);
     LOGI("DCOC 1 done");
 
     DM6302_DCOC(2);
     LOGI("DCOC 2 done");
+    boot_mark("dm6302_dcoc");
 
     DM6302_M0();
     LOGI("M0 done");
+    boot_mark("dm6302_m0");
 
     return 0;
 }

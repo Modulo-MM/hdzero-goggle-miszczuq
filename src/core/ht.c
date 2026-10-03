@@ -225,6 +225,10 @@ static void get_imu_data() {
 }
 
 static void timer_callback_imu(union sigval timer_data) {
+#ifndef EMULATOR_BUILD
+    if (!bmi270_ready())
+        return; // still being configured at boot (see device_init)
+#endif
     get_imu_data();
     calculate_orientation();
 }

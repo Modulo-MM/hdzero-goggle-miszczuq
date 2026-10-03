@@ -35,6 +35,7 @@
 #include "ui/page_storage.h"
 #include "ui/page_version.h"
 #include "ui/ui_porting.h"
+#include "core/boot_timing.h"
 #include "util/sdcard.h"
 #include "util/system.h"
 
@@ -145,6 +146,8 @@ static void check_source_signal(int vtmg_change) {
         is_valid = g_source_info.av_bay_status;
     else
         is_valid = (rx_status[0].rx_valid || rx_status[1].rx_valid);
+
+    boot_timing_signal(is_valid, g_source_info.source);
 
     if (g_setting.ht.alarm_state == SETTING_HT_ALARM_STATE_VIDEO) {
         g_setting.ht.alarm_on_video = is_valid;

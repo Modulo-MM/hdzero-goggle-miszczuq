@@ -6,6 +6,7 @@
 
 #include "../core/common.hh"
 #include "../core/settings.h"
+#include "core/boot_timing.h"
 #ifndef EMULATOR_BUILD
 #include "fbtools.h" // Linux framebuffer — goggle display path only (emulator uses SDL)
 #endif
@@ -82,6 +83,12 @@ static lv_disp_t *disp;
 
 static void hdz_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
     static int orbit_flush = 0;
+    static bool first_flush_marked = false;
+
+    if (!first_flush_marked) {
+        first_flush_marked = true;
+        boot_mark("first_fb_flush");
+    }
 
     // Manipulates the orbiting speed
     if (++orbit_flush % 500 == 0) {

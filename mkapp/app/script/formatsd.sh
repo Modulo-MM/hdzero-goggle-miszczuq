@@ -67,7 +67,9 @@ else
         i=$((i + 1))
     done
     echo "Formatting $PART as FAT32" >> /tmp/mkfs.log
-    mkfs.vfat -F 32 "$PART" -n "HDZERO" >> /tmp/mkfs.log 2>&1
+    # 64 KB clusters: the FAT is read whole when the card is mounted at boot
+    # (~1 s for a 64 GB card at the 16 KB default), and DVR files are large.
+    mkfs.vfat -F 32 -s 128 "$PART" -n "HDZERO" >> /tmp/mkfs.log 2>&1
     RESULT=$?
 fi
 echo "mkfs result: $RESULT" >> /tmp/mkfs.log

@@ -4,11 +4,13 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
 #include "bmi2_defs.h"
 
 void init_bmi270();
 
 void enable_bmi270();
+bool bmi270_ready();
 
 void disable_bmi270();
 

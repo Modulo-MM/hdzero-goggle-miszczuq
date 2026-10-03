@@ -21,6 +21,7 @@ SDL_mutex *global_sdl_mutex;
 
 #include "bmi270/accel_gyro.h"
 #include "core/app_state.h"
+#include "core/boot_timing.h"
 #include "core/common.hh"
 #include "core/elrs.h"
 #include "core/ht.h"
@@ -56,6 +57,7 @@ SDL_mutex *global_sdl_mutex;
 #include "ui/ui_porting.h"
 #include "ui/ui_statusbar.h"
 #include "util/sdcard.h"
+#include "util/system.h"
 
 int gif_cnt = 0;
 
@@ -214,14 +216,60 @@ void start_running(void) {
     // bring-up and wedge the ESP.
 }
 
+#ifdef HDZGOGGLE2
+// Boot speed-up (G2): the BMI270 bring-up (~0.75 s, mostly its config-file
+// upload) runs on a worker thread alongside the rest of init. Nothing on the
+// way to video needs the IMU; I2C transactions are serialized by i2c_mutex,
+// the IMU timer skips reads until bmi270_ready(), and the thread is joined
+// before ht_enable()/ht_disable().
+static pthread_t bmi270_tid;
+static bool bmi270_async = false;
+
+static void *thread_bmi270_init(void *arg) {
+    enable_bmi270();
+    boot_mark("enable_bmi270");
+    return NULL;
+}
+
+// rc.sh sets the vdpo mode in the background on the G2 (~1.5 s in the
+// driver) and removes this file when done. Wait for it before touching the
+// display or the FPGA; capped, and a no-op with an rc.sh that doesn't do it.
+#define VDPO_PENDING_FILE "/tmp/vdpo_pending"
+static void wait_for_vdpo(void) {
+    for (int i = 0; i < 300 && access(VDPO_PENDING_FILE, F_OK) == 0; i++)
+        usleep(10000);
+    if (access(VDPO_PENDING_FILE, F_OK) == 0) {
+        LOGE("vdpo still pending after 3 s, setting it here");
+        system_exec("dispw -s vdpo 1080p50");
+        unlink(VDPO_PENDING_FILE);
+    }
+    boot_mark("vdpo_ready");
+}
+#endif
+
 static void device_init(void) {
     self_test();
+    boot_mark("self_test");
+#ifdef HDZGOGGLE2
+    bmi270_async = pthread_create(&bmi270_tid, NULL, thread_bmi270_init, NULL) == 0;
+    if (!bmi270_async) {
+        enable_bmi270();
+        boot_mark("enable_bmi270");
+    }
+    // IT66021_init() runs later, in main(): see IT66021_reset_early().
+#else
     enable_bmi270();
+    boot_mark("enable_bmi270");
     IT66021_init();
+    boot_mark("IT66021_init");
+#endif
     IT66121_init();
+    boot_mark("IT66121_init");
     TP2825_init(1, g_setting.source.analog_format);
+    boot_mark("TP2825_init");
     DM5680_req_ver();
     fans_top_setspeed(g_setting.fans.top_speed);
+    boot_mark("dm5680_ver_fans");
 }
 
 void lvgl_init() {
@@ -236,6 +284,7 @@ void lvgl_init() {
 }
 
 int main(int argc, char *argv[]) {
+    boot_mark("main_entry");
     pthread_mutex_init(&lvgl_mutex, NULL);
 
 #ifdef EMULATOR_BUILD
@@ -252,14 +301,18 @@ int main(int argc, char *argv[]) {
     // 1. Recall configuration
     settings_init();
     settings_load();
+    boot_mark("settings_load");
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2) || defined(HDZGOGGLE)
     scan_core_self_check();
+    boot_mark("scan_core_self_check");
 #endif
     language_init();
+    boot_mark("language_init");
 #ifdef HDZGOGGLE2
     vclk_phase_init();
 #endif
     pclk_phase_init();
+    boot_mark("pclk_phase_init");
 
     // 2. Initialize communications.
     rtc_init();
@@ -270,42 +323,81 @@ int main(int argc, char *argv[]) {
 #if defined(HDZGOGGLE2) || defined(HDZBOXPRO)
     gpadc_init();
 #endif
+    boot_mark("comm_init");
+#ifdef HDZGOGGLE2
+    wait_for_vdpo();
+    // Start the HDMI-in receiver's reset hold now so it overlaps the init
+    // below; self_test toggles the same reset, so not when it is enabled.
+    if (!g_setting.storage.selftest)
+        IT66021_reset_early();
+#endif
 
     // 3. Initialize core devices.
     mcp3021_init();
+    boot_mark("mcp3021_init");
     input_device_init();
+    boot_mark("input_device_init");
     hw_stat_init();
+    boot_mark("hw_stat_init");
     device_init();
     esp32_init();
+    boot_mark("esp32_init");
     elrs_init();
+    boot_mark("elrs_init");
     ht_init();
+    boot_mark("ht_init");
     beep_init();
+    boot_mark("beep_init");
 
     // 4. Initilize UI
     lvgl_init();
+    boot_mark("lvgl_init");
     main_menu_init();
+    boot_mark("main_menu_init");
+#ifdef HDZGOGGLE2
+    IT66021_init(); // its reset hold has been running since comm_init
+    boot_mark("IT66021_init");
+#endif
     statusbar_init();
+    boot_mark("statusbar_init");
     lv_timer_handler();
+    boot_mark("first_lv_timer_handler");
 
     // 5. Prepare Display
     screen.start_up();
+    boot_mark("screen_start_up");
     Display_UI_init();
+    boot_mark("Display_UI_init");
     screen.pattern(0, 0, 0);
+    boot_mark("screen_pattern");
     osd_init();
+    boot_mark("osd_init");
     ims_init();
+    boot_mark("ims_init");
     ui_osd_element_pos_init();
+    boot_mark("osd_element_pos_init");
 
     // 6. Enable functionality
+#ifdef HDZGOGGLE2
+    if (bmi270_async) {
+        pthread_join(bmi270_tid, NULL);
+        boot_mark("bmi270_joined");
+    }
+#endif
     if (g_setting.ht.enable) {
         ht_enable();
     } else {
         ht_disable();
     }
+    boot_mark("ht_enable");
 
     // 7. Start threads
     g_bootup_sdcard_state = sdcard_mounted() ? 1 : 0;
+    boot_mark("start_running_begin");
     start_running();
+    boot_mark("start_running_end");
     create_threads();
+    boot_mark("create_threads");
 
     // 8. Synthetic counter for gif refresh
     gif_cnt = 0;
@@ -318,6 +410,12 @@ int main(int argc, char *argv[]) {
 
     // 10. Execute main loop
     g_init_done = 1;
+    boot_mark("init_done");
+    // rc.sh holds back the SD log backup and the services until this exists,
+    // so they don't compete with the bring-up.
+    close(open("/tmp/app_init_done", O_WRONLY | O_CREAT, 0644));
+    boot_timing_start();
+    bool first_loop_done = false;
 
 #ifdef EMULATOR_BUILD
     input_device_print_help();
@@ -352,6 +450,11 @@ int main(int argc, char *argv[]) {
         source_status_timer();
         pthread_mutex_unlock(&lvgl_mutex);
 
+        if (!first_loop_done) {
+            first_loop_done = true;
+            boot_mark("main_loop_first_pass");
+        }
+
         if (!elrs_backpack_started) {
             time_t elapsed = time(NULL) - boot_time;
             bool settled = !g_boot_autoscan_running && elapsed >= ELRS_ENABLE_MIN_DELAY_SEC;
@@ -360,6 +463,7 @@ int main(int argc, char *argv[]) {
                 if (g_setting.elrs.enable) {
                     enable_esp32();
                     elrs_watchdog_start();
+                    boot_mark("elrs_backpack_enabled");
                 }
             }
         }

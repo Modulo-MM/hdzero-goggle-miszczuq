@@ -1,8 +1,10 @@
 #include "it66021.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <log/log.h>
@@ -71,12 +73,36 @@ void IT66021_close() {
     DM5680_ResetHDMI_RX(0);
 }
 
-void IT66021_init() {
+#define IT66021_RESET_HOLD_US 300000
+
+static bool rx_reset_early = false;
+static struct timespec rx_reset_early_at;
+
+// Boot speed-up: assert the receiver reset early in boot, so the reset hold in
+// IT66021_init() overlaps other init work; IT66021_init() then only waits for
+// whatever is left of the full hold.
+void IT66021_reset_early() {
     DM5680_ResetHDMI_RX(0);
-    usleep(300000); // long enough for the analog front-end/PLL to fully settle,
-                     // approximating what a physical cable replug gives it --
-                     // the previous 1ms blip wasn't enough to recover a receiver
-                     // already locked onto a signal that predates the reset.
+    clock_gettime(CLOCK_MONOTONIC, &rx_reset_early_at);
+    rx_reset_early = true;
+}
+
+void IT66021_init() {
+    if (rx_reset_early) {
+        rx_reset_early = false;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long held_us = (now.tv_sec - rx_reset_early_at.tv_sec) * 1000000L +
+                       (now.tv_nsec - rx_reset_early_at.tv_nsec) / 1000;
+        if (held_us >= 0 && held_us < IT66021_RESET_HOLD_US)
+            usleep(IT66021_RESET_HOLD_US - held_us);
+    } else {
+        DM5680_ResetHDMI_RX(0);
+        usleep(IT66021_RESET_HOLD_US); // long enough for the analog front-end/PLL to fully settle,
+                                       // approximating what a physical cable replug gives it --
+                                       // the previous 1ms blip wasn't enough to recover a receiver
+                                       // already locked onto a signal that predates the reset.
+    }
     DM5680_ResetHDMI_RX(1);
     usleep(10000);
 

@@ -1,5 +1,23 @@
 #!/bin/sh
 
+# Boot timing marks: "<seconds since kernel start> <tag>" per line, shell
+# builtins only (no forks), into RAM. The app merges them into its report in
+# BOOT_TIMING.log on the SD card when that file exists (src/core/boot_timing.c).
+BOOT_TIMING_SH_LOG=/tmp/boot_timing_sh.log
+function bt()
+{
+	local up rest
+	read up rest < /proc/uptime
+	echo "$up $1" >> $BOOT_TIMING_SH_LOG
+}
+: > $BOOT_TIMING_SH_LOG
+bt rc_start
+# Kernel log as of now, before the display driver's chatter overwrites the
+# early boot in the small ring buffer. Only while boot timing is enabled.
+if [ -e /mnt/extsd/BOOT_TIMING.log ]; then
+	dmesg > /tmp/boot_dmesg_rc_start.log
+fi
+
 PLATFORM="$(cat /mnt/app/platform)"
 
 function insmod_all()
@@ -15,10 +33,32 @@ function setup_uart()
 	echo 0x0300B0fc 0x35517751 > /sys/class/sunxi_dump/write
 }
 
+# Inputs of update_boot / write_flashes on the G2 (see those).
+function sd_has_flash_files()
+{
+	[ -e /mnt/extsd/HDZG_BOOT.bin ] || [ -e /mnt/extsd/HDZG_OS.bin ] ||
+		[ -e /mnt/extsd/HDZGOGGLE_VA.bin ] || [ -e /mnt/extsd/HDZGOGGLE_RX.bin ]
+}
+
 function config_uart_vdpo()
 {
 	setup_uart
 	insmod_all
+
+	# G2: setting the vdpo mode takes ~1.5 s in the driver. Do it in the
+	# background so the app loads meanwhile; the app waits for
+	# /tmp/vdpo_pending to go away before it touches the display (main.c).
+	# Not on a boot that flashes boot/FPGA/RX images from the SD card.
+	if [ $PLATFORM == "HDZGOGGLE2" ] && ! sd_has_flash_files; then
+		: > /tmp/vdpo_pending
+		(
+			dispw -x
+			dispw -s vdpo 1080p50
+			rm -f /tmp/vdpo_pending
+			bt vdpo_set
+		) &
+		return
+	fi
 
 	dispw -x
 
@@ -94,32 +134,57 @@ seed_adjtime
 
 #config UART and VDPO
 config_uart_vdpo
+bt config_uart_vdpo
 
 #check boot&os file, update if exist
 update_boot
+bt update_boot
 
 #auto write HDZERO_TX.bin / HDZERO_RX.bin /HDZERO_VA.bin when bootup if they are exist on SD card
 write_flashes
+bt write_flashes
 
 #load driver 
-sleep 1
 insmod /mnt/app/ko/mcp3021.ko
 usleep 2000
 insmod /mnt/app/ko/nct75.ko
 usleep 2000
+# The app reads the battery ADC through this node right at startup
+# (mcp3021_init). Wait for it instead of the old unconditional "sleep 1"
+# before the insmods; capped at 1 s, so the worst case is the old timing.
+i=0
+while [ ! -e /sys/bus/iio/devices/iio:device0 ] && [ $i -lt 50 ]; do
+	usleep 20000
+	i=$((i + 1))
+done
+bt sensor_drivers
 
 #set Microphone Bias Control Register
 aww 0x050967c0 0x110e6100
 
-#record process
-source /mnt/app//app/record/record-env.sh
-if [ -e /mnt/extsd/RECORD.log ]; then
-	/mnt/app/app/record/record > /mnt/extsd/RECORD.log 2>&1 &
-else
-	/mnt/app/app/record/record &
+# Set the internal log dir aside: the previous boot's logs are copied to the
+# SD card in the background once the app is up (sdstat_log_backup.sh), and the
+# record process logs this boot into a fresh /mnt/app/log. If an earlier
+# backup never ran (no SD card), keep its set and let it go first.
+if [ -d /mnt/app/log ] && [ ! -e /mnt/app/log.prev ]; then
+	mv /mnt/app/log /mnt/app/log.prev
 fi
+[ -d /mnt/app/log ] || mkdir /mnt/app/log
 
-/mnt/app/script/sdstat_log_backup.sh
+#record process
+# record-env.sh also sets LD_LIBRARY_PATH, which the app needs to find its
+# MPP libraries, so it is sourced here whether or not record starts now.
+source /mnt/app//app/record/record-env.sh
+function start_record()
+{
+	if [ -e /mnt/extsd/RECORD.log ]; then
+		/mnt/app/app/record/record > /mnt/extsd/RECORD.log 2>&1 &
+	else
+		/mnt/app/app/record/record &
+	fi
+	bt record_started
+}
+start_record
 
 	#system led
 if [ $PLATFORM == "HDZGOGGLE" ]; then
@@ -128,22 +193,68 @@ elif [ $PLATFORM == "HDZGOGGLE2" ]; then
 	/mnt/app/script/system_daemon.sh &
 fi
 
-#external services
-if [ ! -z $(ls -1 /mnt/extsd/hdzgoggle-services-* 2> /dev/null) ]; then
-	if [ -e /mnt/extsd/SERVICES.log ]; then
-		/mnt/app/services/install.sh > /mnt/extsd/SERVICES.log 2>&1 &
-	else
-		/mnt/app/services/install.sh &
-	fi
-elif [ -e /mnt/app/services/startup.sh ]; then
-	if [ -e /mnt/extsd/SERVICES.log ]; then
-		/mnt/app/services/startup.sh > /mnt/extsd/SERVICES.log 2>&1 &
-	else
-		/mnt/app/services/startup.sh &
-	fi
-fi
+# /etc/init.d/S50usb must stay the vendor original. A test build (boottiming3)
+# backgrounded its start() via the rootfs overlay to skip its "sleep 2"; that
+# let the USB driver load race this script's first I2C accesses (mcp3021
+# insmod) and the i2c1 bus hung for the whole boot (xfer timeouts, app stuck).
+# Undo that edit wherever it is still present: copy the read-only original
+# back over the overlay copy (mv over it, never rm: that leaves a whiteout).
+S50USB=/etc/init.d/S50usb
+S50USB_ORIG=/squashfs/etc/init.d/S50usb
+function s50usb_heal()
+{
+	[ -f $S50USB_ORIG ] || return
+	cmp -s $S50USB_ORIG $S50USB && return
+	cat $S50USB_ORIG > $S50USB.tmp && chmod 755 $S50USB.tmp &&
+		mv $S50USB.tmp $S50USB && sync && bt s50usb_restored
+	rm -f $S50USB.tmp
+}
 
+# Deferred work: start it once the app has finished its bring-up (the app
+# creates /tmp/app_init_done), so it doesn't compete with it; at most ~30 s.
+(
+	i=0
+	while [ ! -e /tmp/app_init_done ] && [ $i -lt 150 ]; do
+		usleep 200000
+		i=$((i + 1))
+	done
+	bt deferred_start
+
+	# The app did not finish its bring-up in time: if boot timing is enabled,
+	# keep what the system looked like, for diagnosis.
+	if [ ! -e /tmp/app_init_done ] && [ -e /mnt/extsd/BOOT_TIMING.log ]; then
+		{
+			echo "===== app not up after ~30 s, uptime: $(cat /proc/uptime)"
+			cat /tmp/boot_timing_sh.log
+			ls /tmp
+			ps
+			dmesg
+		} >> /mnt/extsd/BOOT_HANG.log 2>&1
+		sync
+	fi
+
+	/mnt/app/script/sdstat_log_backup.sh /mnt/app/log.prev
+
+	#external services
+	if [ ! -z $(ls -1 /mnt/extsd/hdzgoggle-services-* 2> /dev/null) ]; then
+		if [ -e /mnt/extsd/SERVICES.log ]; then
+			/mnt/app/services/install.sh > /mnt/extsd/SERVICES.log 2>&1 &
+		else
+			/mnt/app/services/install.sh &
+		fi
+	elif [ -e /mnt/app/services/startup.sh ]; then
+		if [ -e /mnt/extsd/SERVICES.log ]; then
+			/mnt/app/services/startup.sh > /mnt/extsd/SERVICES.log 2>&1 &
+		else
+			/mnt/app/services/startup.sh &
+		fi
+	fi
+
+	s50usb_heal
+	bt deferred_end
+) &
 #start applicaion
+bt app_launch
 if [ -e /mnt/extsd/develop.sh ]; then
 	/mnt/extsd/develop.sh
 else
@@ -153,3 +264,4 @@ else
 		/mnt/app/app/HDZGOGGLE &
 	fi
 fi
+bt rc_end

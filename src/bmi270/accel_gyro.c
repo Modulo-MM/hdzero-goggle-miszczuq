@@ -6,6 +6,8 @@
 
 /******************************************************************************/
 /*!                 Header Files                                              */
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <log/log.h>
 #include "bmi270.h"
@@ -59,6 +61,14 @@ static float lsb_to_dps(int16_t val, float dps, uint8_t bit_width);
 /////////////////////////////////////////////////
 //local: bmi2_dev 
 static struct bmi2_dev bmi2_dev;
+// Set once enable_bmi270() has run: on the G2 it runs on a boot-time worker
+// thread (main.c), and the IMU timer must not read the chip before that.
+static atomic_bool bmi270_enabled = false;
+
+bool bmi270_ready()
+{
+    return bmi270_enabled;
+}
 
 void init_bmi270()
 {
@@ -89,6 +99,7 @@ void enable_bmi270()
     }
     else
         LOGE("[Error] BMI270 failed.");
+    bmi270_enabled = true;
 }
 
 void disable_bmi270()
