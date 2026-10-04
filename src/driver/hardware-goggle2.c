@@ -2,6 +2,7 @@
 
 #if HDZGOGGLE2
 
+#include <minIni.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -549,8 +550,16 @@ void hw_screen_on(int bON) {
     pthread_mutex_unlock(&hardware_mutex);
 }
 
-// The vdpo mode rc.sh set at boot (/tmp/vdpo_mode): 1080p50, or the analog
-// mode under the analog_direct boot experiment (see rc.sh boot_vdpo_mode).
+// Set the vdpo mode unless rc.sh already set exactly this one at boot (the
+// analog_direct/hdzero_direct boot experiments); every set costs ~1.1 s.
+static void vdpo_set_mode(const char *cmd, int tmg) {
+    if (g_init_done || g_hw_stat.vdpo_tmg != tmg)
+        system_exec(cmd);
+    g_hw_stat.vdpo_tmg = tmg;
+}
+
+// The vdpo mode rc.sh set at boot (/tmp/vdpo_mode): 1080p50, or the analog or
+// HDZero mode under the boot experiments (see rc.sh boot_vdpo_mode).
 static int boot_vdpo_tmg(void) {
     char mode[16] = "";
     FILE *fp = fopen("/tmp/vdpo_mode", "r");
@@ -563,6 +572,10 @@ static int boot_vdpo_tmg(void) {
         return VDPO_TMG_720P50;
     if (strncmp(mode, "720p60", 6) == 0)
         return VDPO_TMG_720P60;
+    if (strncmp(mode, "720p90", 6) == 0)
+        return VDPO_TMG_720P90;
+    if (strncmp(mode, "1080p60", 7) == 0)
+        return VDPO_TMG_1080P60;
     return VDPO_TMG_1080P50;
 }
 
@@ -616,8 +629,7 @@ void Display_720P60_50_t(int mode, uint8_t is_43) // fps: 0=50, 1=60
     screen.display(0);
     I2C_Write(ADDR_FPGA, 0x8C, 0x00);
 
-    system_exec("dispw -s vdpo 720p60");
-    g_hw_stat.vdpo_tmg = VDPO_TMG_720P60;
+    vdpo_set_mode("dispw -s vdpo 720p60", VDPO_TMG_720P60);
     vclk_phase_set(VIDEO_SOURCE_HDZERO_IN_720P60_50, 0);
     pclk_phase_set(VIDEO_SOURCE_HDZERO_IN_720P60_50);
 
@@ -645,8 +657,7 @@ void Display_720P90_t(int mode) {
     screen.display(0);
     I2C_Write(ADDR_FPGA, 0x8C, 0x00);
 
-    system_exec("dispw -s vdpo 720p90");
-    g_hw_stat.vdpo_tmg = VDPO_TMG_720P90;
+    vdpo_set_mode("dispw -s vdpo 720p90", VDPO_TMG_720P90);
     vclk_phase_set(VIDEO_SOURCE_HDZERO_IN_720P90, 0);
     pclk_phase_set(VIDEO_SOURCE_HDZERO_IN_720P90);
     I2C_Write(ADDR_FPGA, 0x80, 0x03);
@@ -668,8 +679,7 @@ void Display_1080P30_t(int mode) {
     screen.display(0);
     I2C_Write(ADDR_FPGA, 0x8C, 0x00);
 
-    system_exec("dispw -s vdpo 1080p60");
-    g_hw_stat.vdpo_tmg = VDPO_TMG_1080P60;
+    vdpo_set_mode("dispw -s vdpo 1080p60", VDPO_TMG_1080P60);
     vclk_phase_set(VIDEO_SOURCE_HDZERO_IN_1080P30, 0);
     pclk_phase_set(VIDEO_SOURCE_HDZERO_IN_1080P30);
 
@@ -692,8 +702,7 @@ void Display_1080P24_t(int mode) {
     screen.display(0);
     I2C_Write(ADDR_FPGA, 0x8C, 0x00);
 
-    system_exec("dispw -s vdpo 1080p60");
-    g_hw_stat.vdpo_tmg = VDPO_TMG_1080P60;
+    vdpo_set_mode("dispw -s vdpo 1080p60", VDPO_TMG_1080P60);
     vclk_phase_set(VIDEO_SOURCE_HDZERO_IN_1080P30, 0);
     pclk_phase_set(VIDEO_SOURCE_HDZERO_IN_1080P30);
 
@@ -760,10 +769,57 @@ void HDZero_Close() {
     LOGI("HDZero: close");
 }
 
+// The HDZero camera mode last applied to the display. Restored at boot from
+// setting.ini (HDZero_restore_cam_mode), so the first HDZero entry already
+// uses the camera's vdpo timing instead of 720p60 and a second ~1.1 s switch
+// once the camera reports e.g. 540p90; saved whenever it changes.
+static video_resolution_t cam_mode_last = VR_720P60;
+static uint8_t cam_4_3_last = 0;
+static int cam_mode_saved = -1;
+static int cam_4_3_saved = -1;
+
+static bool cam_mode_supported(int mode) {
+    switch (mode) {
+    case VR_720P50:
+    case VR_720P60:
+    case VR_960x720P60:
+    case VR_540P60:
+    case VR_540P90:
+    case VR_540P90_CROP:
+    case VR_1080P30:
+    case VR_1080P24:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void HDZero_restore_cam_mode(void) {
+    cam_mode_saved = ini_getl("source", "hdz_cam_mode", -1, SETTING_INI);
+    cam_4_3_saved = ini_getl("source", "hdz_cam_4_3", -1, SETTING_INI);
+    if (cam_mode_supported(cam_mode_saved)) {
+        CAM_MODE = cam_mode_saved;
+        cam_mode_last = cam_mode_saved;
+    }
+    // cam_4_3_last keeps its stock initial value, so the camera's ratio is
+    // still applied (set_ratio) on its first report after the Display_* call.
+    if (cam_4_3_saved == 0 || cam_4_3_saved == 1)
+        cam_4_3 = cam_4_3_saved;
+}
+
+static void cam_mode_save(void) {
+    if (CAM_MODE != cam_mode_saved && cam_mode_supported(CAM_MODE)) {
+        ini_putl("source", "hdz_cam_mode", CAM_MODE, SETTING_INI);
+        cam_mode_saved = CAM_MODE;
+    }
+    if (cam_4_3 != cam_4_3_saved) {
+        ini_putl("source", "hdz_cam_4_3", cam_4_3, SETTING_INI);
+        cam_4_3_saved = cam_4_3;
+    }
+}
+
 int HDZERO_detect() // return = 1: vtmg to V536 changed
 {
-    static video_resolution_t cam_mode_last = VR_720P60;
-    static uint8_t cam_4_3_last = 0;
     int ret = 0;
 
     pthread_mutex_lock(&hardware_mutex);
@@ -806,12 +862,14 @@ int HDZERO_detect() // return = 1: vtmg to V536 changed
             dvr_update_vi_conf(CAM_MODE);
             system_script(REC_STOP_LIVE);
             cam_mode_last = CAM_MODE;
+            cam_mode_save();
             ret = 1;
         }
 
         if (cam_4_3_last != cam_4_3) {
             LOGI("cam_4_3: %d  CAM_MODE=%d", cam_4_3, CAM_MODE);
             cam_4_3_last = cam_4_3;
+            cam_mode_save();
 
             if (CAM_MODE != VR_720P50) {
                 screen.mfpga.set_ratio(cam_4_3); // set ratio for 720P60/90/1080P30

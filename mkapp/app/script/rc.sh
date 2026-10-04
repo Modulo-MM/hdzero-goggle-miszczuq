@@ -12,10 +12,23 @@ function bt()
 }
 : > $BOOT_TIMING_SH_LOG
 bt rc_start
+
+# Is the SD card mounted? Shell builtins only.
+function sd_mounted()
+{
+	local dev mnt rest
+	while read dev mnt rest; do
+		[ "$mnt" = /mnt/extsd ] && return 0
+	done < /proc/mounts
+	return 1
+}
+
 # Kernel log as of now, before the display driver's chatter overwrites the
-# early boot in the small ring buffer. Only while boot timing is enabled.
-if [ -e /mnt/extsd/BOOT_TIMING.log ]; then
+# early boot in the small ring buffer: while boot timing is enabled, and on
+# boots without an SD card (see BOOT_NOSD.log below).
+if [ -e /mnt/extsd/BOOT_TIMING.log ] || ! sd_mounted; then
 	dmesg > /tmp/boot_dmesg_rc_start.log
+	sd_mounted || echo "rc.sh started without SD card, uptime $(cat /proc/uptime)" > /mnt/UDISK/BOOT_NOSD.log
 fi
 
 PLATFORM="$(cat /mnt/app/platform)"
@@ -46,17 +59,21 @@ function sd_has_flash_files()
 # 1080p50 first and the analog mode ~1.1 s later. 1080p50 otherwise.
 function boot_vdpo_mode()
 {
-	if [ ! -e /mnt/extsd/bootopt/analog_direct ]; then
+	local ad=0 hd=0
+	[ -e /mnt/extsd/bootopt/analog_direct ] && ad=1
+	[ -e /mnt/extsd/bootopt/hdzero_direct ] && hd=1
+	if [ $ad = 0 ] && [ $hd = 0 ]; then
 		echo 1080p50
 		return
 	fi
-	awk -F= '
+	awk -F= -v ad=$ad -v hd=$hd '
 		/^\[/ { sec = $0; next }
 		sec == "[autoscan]" && $1 == "status" { st = $2 }
 		sec == "[autoscan]" && $1 == "source" { src = $2 }
 		sec == "[autoscan]" && $1 == "last_source" { last = $2 }
 		sec == "[autoscan]" && $1 == "load_from_boot" { lfb = $2 }
 		sec == "[source]" && $1 == "analog_format" { fmt = $2 }
+		sec == "[source]" && $1 == "hdz_cam_mode" { cam = $2 }
 		END {
 			# Keys missing from setting.ini take the defaults of the app
 			# (g_setting_defaults): Auto Scan On, source HDZero, NTSC.
@@ -67,10 +84,21 @@ function boot_vdpo_mode()
 			if (fmt == "") fmt = 0
 			s = (src == 0) ? last : src
 			scan = (st == 0 && lfb != "true")
-			if (s == 3 || (s == 2 && !scan))
+			if (ad && (s == 3 || (s == 2 && !scan))) {
 				print (fmt == 1 ? "720p50" : "720p60")
-			else
+			} else if (hd && s == 1 && (st == 1 || (st == 0 && lfb == "true"))) {
+				# HDZero entered directly: the timing of the saved camera
+				# mode (hdz_cam_mode, src/driver/hardware-goggle2.c),
+				# 720p60 for the default camera mode when not saved yet.
+				if (cam == 3 || cam == 6)
+					print "720p90"
+				else if (cam == 7 || cam == 8)
+					print "1080p60"
+				else
+					print "720p60"
+			} else {
 				print "1080p50"
+			}
 		}' /mnt/app/setting.ini 2>/dev/null || echo 1080p50
 }
 
@@ -255,6 +283,29 @@ function s50usb_heal()
 		i=$((i + 1))
 	done
 	bt deferred_start
+
+	# Boot without an SD card: keep a snapshot on the internal UDISK
+	# partition; the next boot with a card moves it to BOOT_NOSD.log there.
+	if ! sd_mounted; then
+		{
+			echo "===== boot without SD card, uptime: $(cat /proc/uptime)"
+			echo "--- rc.sh marks"; cat /tmp/boot_timing_sh.log
+			if [ -e /tmp/app_init_done ]; then echo "--- app init: done"; else echo "--- app init: NOT done"; fi
+			echo "--- /tmp"; ls /tmp
+			echo "--- ps"; ps
+			for p in $(pidof HDZGOGGLE record); do
+				echo "--- threads of $p: name state wchan"
+				for t in /proc/$p/task/*; do
+					echo "$(cat $t/comm) $(cut -d' ' -f3 $t/stat) $(cat $t/wchan)"
+				done
+			done
+			echo "--- dmesg at rc.sh start"; cat /tmp/boot_dmesg_rc_start.log
+			echo "--- dmesg now"; dmesg
+		} >> /mnt/UDISK/BOOT_NOSD.log 2>&1
+		sync
+	elif [ -e /mnt/UDISK/BOOT_NOSD.log ]; then
+		mv /mnt/UDISK/BOOT_NOSD.log /mnt/extsd/BOOT_NOSD.log && sync
+	fi
 
 	# The app did not finish its bring-up in time: if boot timing is enabled,
 	# keep what the system looked like, for diagnosis.

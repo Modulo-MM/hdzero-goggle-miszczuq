@@ -315,6 +315,9 @@ int main(int argc, char *argv[]) {
     // 1. Recall configuration
     settings_init();
     settings_load();
+#ifdef HDZGOGGLE2
+    HDZero_restore_cam_mode(); // the last HDZero camera mode, for the first Display_* call
+#endif
     boot_mark("settings_load");
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2) || defined(HDZGOGGLE)
     scan_core_self_check();

@@ -84,6 +84,7 @@ void hw_stat_init();
 
 void hw_screen_on(int bON);
 void HDZero_open(int bw);
+void HDZero_restore_cam_mode(void); // G2: see hardware-goggle2.c
 void HDZero_Close();
 
 void Source_HDMI_in();

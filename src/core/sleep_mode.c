@@ -1,6 +1,7 @@
 #include "sleep_mode.h"
 
 #include "core/app_state.h"
+#include "core/boot_timing.h"
 #include "core/common.hh"
 #include "core/dvr.h"
 #include "core/settings.h"
@@ -23,6 +24,7 @@ bool isSleeping = false;
 
 void go_sleep() {
     LOGI("Entering sleep mode");
+    wake_timing_sleep();
     previousState = g_app_state;
     app_state_push(APP_STATE_SLEEP);
 
@@ -63,8 +65,23 @@ void go_sleep() {
 
 void wake_up() {
     LOGI("Exiting sleep mode");
+    // G2: sleep entered from analog video goes straight back to it (see
+    // app_wake_to_analog); everything else re-enters through the menu.
+    bool fast_analog = false;
+    bool fast_hdzero = false;
+#ifdef HDZGOGGLE2
+    fast_analog = previousState == APP_STATE_VIDEO &&
+                  (g_source_info.source == SOURCE_AV_MODULE || g_source_info.source == SOURCE_AV_IN);
+    fast_hdzero = previousState == APP_STATE_VIDEO && g_source_info.source == SOURCE_HDZERO;
+#endif
+    wake_timing_wake(g_source_info.source, fast_analog || fast_hdzero);
+
     isSleeping = false;
-    screen_set_inhibited(SCREEN_INHIBIT_SLEEP, false);
+    // HDZero fast wake: screens stay dark until the receiver is back (~2 s)
+    if (!fast_hdzero) {
+        screen_set_inhibited(SCREEN_INHIBIT_SLEEP, false);
+        wake_timing_mark("screen_on");
+    }
 
     Analog_Module_Power(1);
     g_setting.fans.right_speed = fan_speed_save.right;
@@ -79,10 +96,19 @@ void wake_up() {
     app_state_push(previousState);
     if (previousState == APP_STATE_SUBMENU) {
         submenu_exit();
+    } else if (fast_analog) {
+        app_wake_to_analog(g_source_info.source == SOURCE_AV_IN);
+        wake_timing_mark("analog_rx_on");
+    } else if (fast_hdzero) {
+        app_wake_to_hdzero();
+        screen_set_inhibited(SCREEN_INHIBIT_SLEEP, false);
+        wake_timing_mark("screen_on");
+        wake_timing_mark("source_reentered");
     } else if (previousState == APP_STATE_VIDEO) {
         app_switch_to_menu();          // Necessary to display the progress bar
         app_state_push(previousState); // Because app_switch_to_menu() pushes main menu state
         app_exit_menu();
+        wake_timing_mark("source_reentered");
     }
 }
 

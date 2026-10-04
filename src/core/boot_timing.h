@@ -27,6 +27,13 @@ void boot_timing_start(void);
 // the report, so every report says which variant was measured.
 bool boot_opt(const char *name);
 
+// Sleep/wake timing, same BOOT_TIMING.log opt-in: go_sleep() calls
+// wake_timing_sleep(), wake_up() calls wake_timing_wake(); a short report is
+// appended once the source shows a valid signal again (or after 30 s).
+void wake_timing_sleep(void);
+void wake_timing_wake(int source, bool fast);
+void wake_timing_mark(const char *tag);
+
 #ifdef __cplusplus
 }
 #endif

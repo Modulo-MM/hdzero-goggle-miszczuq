@@ -1236,12 +1236,140 @@ typedef union _EFUSE {
 
 EFUSE_T efuse0, efuse1;
 
+// The EFUSE contents are factory calibration and never change, but reading
+// them back through the FPGA's SPI bridge takes ~0.75 s per chip, and
+// DM6302_init() runs on every HDZero entry (boot, wake from sleep, source and
+// bandwidth switches, scans). Read them once per run and afterwards only
+// re-apply them; the register state left behind is the same either way.
+static bool efuse_cached[2] = {false, false};
+
+// The cache also survives reboots in a file on the internal UDISK partition
+// (kept across firmware updates). A copy is used only after the chip matches
+// it: band_num (macro 0) and all of macro 1 (bandgap, temp sensor, ical/rcal)
+// are read back and compared, 14 bytes instead of the ~150 of a full read.
+// On any mismatch the full read runs and the file is rewritten.
+#define EFUSE_FILE       "/mnt/UDISK/dm6302_efuse.bin"
+#define EFUSE_FILE_MAGIC 0x45464d44 // "DMFE"
+#define EFUSE_FILE_VER   1
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    EFUSE_T efuse[2]; // [0] = chip 1 (efuse0), [1] = chip 2 (efuse1)
+    uint32_t sum;
+} efuse_file_t;
+
+static efuse_file_t efuse_file;
+static int efuse_file_state = 0; // 0 = not loaded yet, 1 = usable, -1 = none/invalid
+static bool efuse_file_stale = false;
+
+static uint32_t efuse_file_sum(const efuse_file_t *f) {
+    const uint8_t *p = (const uint8_t *)f->efuse;
+    uint32_t h = 2166136261u; // FNV-1a
+    for (size_t n = 0; n < sizeof(f->efuse); n++)
+        h = (h ^ p[n]) * 16777619u;
+    return h;
+}
+
+static void efuse_file_load(void) {
+    FILE *fp = fopen(EFUSE_FILE, "rb");
+    efuse_file_state = -1;
+    if (!fp)
+        return;
+    if (fread(&efuse_file, 1, sizeof(efuse_file), fp) == sizeof(efuse_file) &&
+        efuse_file.magic == EFUSE_FILE_MAGIC && efuse_file.version == EFUSE_FILE_VER &&
+        efuse_file.sum == efuse_file_sum(&efuse_file))
+        efuse_file_state = 1;
+    fclose(fp);
+}
+
+static void efuse_file_save(void) {
+    efuse_file_stale = false; // one attempt per full read, not one per init
+    efuse_file.magic = EFUSE_FILE_MAGIC;
+    efuse_file.version = EFUSE_FILE_VER;
+    memcpy(&efuse_file.efuse[0], &efuse0, sizeof(EFUSE_T));
+    memcpy(&efuse_file.efuse[1], &efuse1, sizeof(EFUSE_T));
+    efuse_file.sum = efuse_file_sum(&efuse_file);
+
+    FILE *fp = fopen(EFUSE_FILE ".tmp", "wb");
+    if (!fp)
+        return;
+    bool ok = fwrite(&efuse_file, 1, sizeof(efuse_file), fp) == sizeof(efuse_file);
+    ok = (fflush(fp) == 0) && ok;
+    fsync(fileno(fp));
+    fclose(fp);
+    if (ok && rename(EFUSE_FILE ".tmp", EFUSE_FILE) == 0) {
+        efuse_file_state = 1;
+        LOGI("EFUSE saved to " EFUSE_FILE);
+    } else {
+        unlink(EFUSE_FILE ".tmp");
+    }
+}
+
+// One EFUSE byte, the same register sequence as the read loops below.
+static uint8_t efuse_read_byte(uint8_t SEL6302, int macro, int j) {
+    uint32_t r0, r1, rdat_sel;
+
+    SPI_Write(SEL6302, 0x3, 0x7D0, (macro << 11) | (j << 4) | 0x1);
+    do {
+        SPI_Read(0x3, 0x7D4, &r0, &r1);
+        rdat_sel = (SEL6302 == 1) ? r0 : r1;
+    } while (rdat_sel & 1);
+    SPI_Read(0x3, 0x7D8, &r0, &r1);
+    rdat_sel = (SEL6302 == 1) ? r0 : r1;
+    return rdat_sel & 0xFF;
+}
+
+// Does the chip match the saved copy? Leaves the EFUSE block in the same
+// state as the end of a full read.
+static bool efuse_file_matches(uint8_t SEL6302, const EFUSE_T *saved) {
+    bool match = true;
+    int j;
+
+    SPI_Write(SEL6302, 0x6, 0xFF0, 0x00000019);
+    SPI_Write(SEL6302, 0x3, 0x0E0, 0x00000001);
+    SPI_Write(SEL6302, 0x6, 0xFF0, 0x00000018);
+    for (j = 66; j < 68 && match; j++) // macro 0: band_num
+        match = efuse_read_byte(SEL6302, 0, j) == saved->dat[0][j];
+    for (j = 0; j < 12 && match; j++) // macro 1
+        match = efuse_read_byte(SEL6302, 1, j) == saved->dat[1][j];
+    SPI_Write(SEL6302, 0x3, 0x7D0, 0x00000000);
+    SPI_Write(SEL6302, 0x6, 0xFF0, 0x00000019);
+    SPI_Write(SEL6302, 0x3, 0x0E0, 0x00000000);
+
+    return match && saved->macro.m0.band_num >= 1 && saved->macro.m0.band_num <= EFUSE_NUM - 2;
+}
+
 void DM6302_EFUSE1(uint8_t SEL6302) {
     int i, j;
     uint32_t r0, r1, rdat_sel;
     int efuse_rdy = 1;
 
     EFUSE_T *efuse_sel = (SEL6302 == 1) ? (&efuse0) : (&efuse1);
+    bool *cached = &efuse_cached[SEL6302 == 1 ? 0 : 1];
+
+    if (*cached) {
+        // The writes that end the read sequence below.
+        SPI_Write(SEL6302, 0x3, 0x7D0, 0x00000000);
+        SPI_Write(SEL6302, 0x6, 0xFF0, 0x00000019);
+        SPI_Write(SEL6302, 0x3, 0x0E0, 0x00000000);
+        LOGI("EFUSE1 %d, cached", SEL6302);
+        goto apply;
+    }
+
+    if (efuse_file_state == 0)
+        efuse_file_load();
+    if (efuse_file_state == 1) {
+        const EFUSE_T *saved = &efuse_file.efuse[SEL6302 == 1 ? 0 : 1];
+        if (efuse_file_matches(SEL6302, saved)) {
+            memcpy(efuse_sel, saved, sizeof(EFUSE_T));
+            *cached = true;
+            LOGI("EFUSE1 %d, from file", SEL6302);
+            goto apply;
+        }
+        LOGI("EFUSE1 %d, file does not match the chip, full read", SEL6302);
+        efuse_file_state = -1;
+    }
 
     memset((char *)efuse_sel, 0, sizeof(EFUSE_T));
 
@@ -1358,6 +1486,14 @@ void DM6302_EFUSE1(uint8_t SEL6302) {
     // EFUSE_RST = 0;
     SPI_Write(SEL6302, 0x6, 0xFF0, 0x00000019);
     SPI_Write(SEL6302, 0x3, 0x0E0, 0x00000000);
+
+    // Keep only plausible contents (band_num indexes macros 2..11).
+    if (efuse_sel->macro.m0.band_num >= 1 && efuse_sel->macro.m0.band_num <= EFUSE_NUM - 2) {
+        *cached = true;
+        efuse_file_stale = true;
+    }
+
+apply:
 
 #if (0)
     // application
@@ -1698,6 +1834,8 @@ int DM6302_init(uint8_t freq, uint8_t bw) {
 
     DM6302_EFUSE1(2);
     LOGI("EFUSE1 2 done");
+    if (efuse_file_stale && efuse_cached[0] && efuse_cached[1])
+        efuse_file_save(); // a full read happened: keep it for the next boots
     boot_mark("dm6302_efuse1");
 
     DM6302_Init1(0, bw);

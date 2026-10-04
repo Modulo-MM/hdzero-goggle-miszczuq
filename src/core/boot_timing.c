@@ -2,6 +2,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,7 +122,127 @@ bool boot_opt(const char *name) {
     return enabled;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// Sleep/wake timing
+
+#define WAKE_MAX_MARKS 24
+#define WAKE_TIMEOUT_S 30
+
+static pthread_mutex_t wake_mutex = PTHREAD_MUTEX_INITIALIZER;
+static double wake_sleep_at = 0;
+static boot_mark_t wake_marks[WAKE_MAX_MARKS];
+static int wake_mark_count = 0;
+static int wake_generation = 0; // a newer wake retires an older report
+static atomic_bool wake_active = false;
+static atomic_bool wake_signal_seen = false;
+// Set by the analog_rx_on / source_reentered mark: only signals seen after
+// the source is back up count, not a detector value still left from before.
+static atomic_bool wake_source_ready = false;
+static int wake_source = -1;
+static bool wake_fast = false;
+
+void wake_timing_sleep(void) {
+    wake_sleep_at = boot_now();
+}
+
+void wake_timing_mark(const char *tag) {
+    if (!wake_active)
+        return;
+    double t = boot_now();
+    pthread_mutex_lock(&wake_mutex);
+    if (wake_mark_count < WAKE_MAX_MARKS) {
+        wake_marks[wake_mark_count].t = t;
+        wake_marks[wake_mark_count].tag = tag;
+        wake_mark_count++;
+    }
+    pthread_mutex_unlock(&wake_mutex);
+
+    if (strcmp(tag, "analog_rx_on") == 0 || strcmp(tag, "source_reentered") == 0)
+        wake_source_ready = true;
+}
+
+static void wake_report_write(const char *path) {
+    FILE *out = fopen(path, "a");
+    if (!out)
+        return;
+
+    char wall[32] = "?";
+    time_t now = time(NULL);
+    strftime(wall, sizeof(wall), "%F %T", gmtime(&now));
+
+    pthread_mutex_lock(&wake_mutex);
+    double t0 = wake_mark_count ? wake_marks[0].t : 0;
+    fprintf(out, "\n===== WAKE TIMING REPORT %s (RTC) =====\n", wall);
+    fprintf(out, "platform: %s, source: %d, path: %s, slept: %.1f s\n", BOOT_TIMING_PLATFORM, wake_source,
+            wake_fast ? "fast (straight back to the source)" : "menu, then source re-entry",
+            wake_sleep_at > 0 ? t0 - wake_sleep_at : -1.0);
+    fprintf(out, "-- marks: seconds since wake --\n");
+    double signal_at = -1;
+    for (int i = 0; i < wake_mark_count; i++) {
+        fprintf(out, "%8.3f  %s\n", wake_marks[i].t - t0, wake_marks[i].tag);
+        if (strcmp(wake_marks[i].tag, "first_valid_signal") == 0)
+            signal_at = wake_marks[i].t - t0;
+    }
+    pthread_mutex_unlock(&wake_mutex);
+
+    if (signal_at >= 0)
+        fprintf(out, "wake -> first valid signal: %.3f s\n", signal_at);
+    else
+        fprintf(out, "wake -> first valid signal: none within %d s\n", WAKE_TIMEOUT_S);
+    fprintf(out, "===== END =====\n");
+    fflush(out);
+    fsync(fileno(out));
+    fclose(out);
+}
+
+static void *wake_report_thread(void *arg) {
+    int generation = (int)(intptr_t)arg;
+    double start = boot_now();
+
+    while (!wake_signal_seen && boot_now() - start < WAKE_TIMEOUT_S) {
+        if (generation != wake_generation)
+            return NULL; // woken again meanwhile; that wake reports
+        usleep(100000);
+    }
+    usleep(200000); // let the caller's last marks land
+
+    if (generation == wake_generation) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", path_extsd(), BOOT_TIMING_FILE);
+        if (fs_file_exists(path))
+            wake_report_write(path);
+        wake_active = false;
+    }
+    return NULL;
+}
+
+void wake_timing_wake(int source, bool fast) {
+    pthread_mutex_lock(&wake_mutex);
+    wake_generation++;
+    wake_mark_count = 0;
+    wake_source = source;
+    wake_fast = fast;
+    int generation = wake_generation;
+    pthread_mutex_unlock(&wake_mutex);
+
+    wake_signal_seen = false;
+    wake_source_ready = false;
+    wake_active = true;
+    wake_timing_mark("wake_begin");
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, wake_report_thread, (void *)(intptr_t)generation) == 0)
+        pthread_detach(tid);
+    else
+        wake_active = false;
+}
+
 void boot_timing_signal(bool is_valid, int source) {
+    if (is_valid && wake_active && wake_source_ready && !wake_signal_seen) {
+        wake_timing_mark("first_valid_signal");
+        wake_signal_seen = true;
+    }
+
     if (!is_valid || signal_seen || marking_done)
         return;
 

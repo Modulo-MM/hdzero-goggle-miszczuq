@@ -84,34 +84,9 @@ void app_exit_menu() {
     }
 }
 
-#ifdef HDZGOGGLE2
-// Boot speed-up (G2): the audio routing is several audio_sel.sh runs, each a
-// shell plus a few amixer processes (~1-1.4 s in all), and the first video
-// frame does not need it. During the initial bring-up it runs on a worker;
-// dvr_mute/restore_live_audio wait for it (dvr_audio_route_lock).
-static void *thread_boot_audio_route(void *arg) {
-    dvr_select_audio_source(g_setting.record.audio_source);
-    dvr_enable_line_out(true);
-    dvr_audio_route_unlock();
-    boot_mark("av_audio_routed");
-    return NULL;
-}
-#endif
-
-void app_switch_to_analog(bool is_av_in) {
-    boot_mark("switch_to_analog_begin");
-    dvr_update_vi_conf(VR_720P50);
-    osd_fhd(0);
-    osd_show(true);
-    lvgl_switch_to_720p();
-    osd_clear();
-    lv_timer_handler();
-    Display_Osd(g_setting.record.osd);
-
-    Source_AV(is_av_in);
-    image_settings_apply(SETTING_IMAGE_SOURCE_ANALOG);
-    boot_mark("av_image_settings");
-
+// Power and tune the receiver feeding the analog source (shared by the
+// source switch and the G2 fast wake from sleep).
+static void analog_receiver_on(bool is_av_in) {
     if (is_av_in) {
         rtc6715.init(0, 0);
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2)
@@ -145,7 +120,64 @@ void app_switch_to_analog(bool is_av_in) {
 #endif
         }
     }
+}
 
+#ifdef HDZGOGGLE2
+// Fast wake from sleep straight back into analog video (G2). Sleep entered
+// from video leaves the display in the analog mode, the decoder configured
+// and the audio routing as they were, and only powers the receivers down
+// (go_sleep), so power the receiver back up instead of going through the
+// menu and a full source re-entry (~4 s: two vdpo mode sets, sleep(1),
+// audio routing).
+void app_wake_to_analog(bool is_av_in) {
+    dvr_update_vi_conf(VR_720P50); // go_sleep() set it for 1080p30
+    analog_receiver_on(is_av_in);
+}
+
+// Fast wake from sleep straight back into HDZero video (G2). The display
+// stayed in the camera's mode and go_sleep() only closed the receiver
+// (HDZero_Close), so reopen it and retune instead of the menu detour and a
+// full source switch (two vdpo mode sets, ~1.1 s each). DM6302_init uses
+// the cached EFUSE data.
+void app_wake_to_hdzero(void) {
+    scan_core_notify_analog_powered_off(); // go_sleep() powered the RTC6715 down
+    dvr_update_vi_conf(CAM_MODE); // go_sleep() set it for 1080p30
+    HDZero_open(hdzero_effective_bw());
+    DM6302_SetChannel(g_setting.source.hdzero_band, (g_setting.scan.channel - 1) & 0x7f);
+    DM5680_clear_vldflg();
+    DM5680_req_vldflg();
+}
+#endif
+
+#ifdef HDZGOGGLE2
+// Boot speed-up (G2): the audio routing is several audio_sel.sh runs, each a
+// shell plus a few amixer processes (~1-1.4 s in all), and the first video
+// frame does not need it. During the initial bring-up it runs on a worker;
+// dvr_mute/restore_live_audio wait for it (dvr_audio_route_lock).
+static void *thread_boot_audio_route(void *arg) {
+    dvr_select_audio_source(g_setting.record.audio_source);
+    dvr_enable_line_out(true);
+    dvr_audio_route_unlock();
+    boot_mark("av_audio_routed");
+    return NULL;
+}
+#endif
+
+void app_switch_to_analog(bool is_av_in) {
+    boot_mark("switch_to_analog_begin");
+    dvr_update_vi_conf(VR_720P50);
+    osd_fhd(0);
+    osd_show(true);
+    lvgl_switch_to_720p();
+    osd_clear();
+    lv_timer_handler();
+    Display_Osd(g_setting.record.osd);
+
+    Source_AV(is_av_in);
+    image_settings_apply(SETTING_IMAGE_SOURCE_ANALOG);
+    boot_mark("av_image_settings");
+
+    analog_receiver_on(is_av_in);
     boot_mark("av_rtc6715");
 
     g_setting.autoscan.last_source = is_av_in ? SETTING_AUTOSCAN_SOURCE_AV_IN : SETTING_AUTOSCAN_SOURCE_AV_MODULE;
