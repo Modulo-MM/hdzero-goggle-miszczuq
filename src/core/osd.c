@@ -16,6 +16,7 @@
 #include <lvgl/lvgl.h>
 #include <minIni.h>
 
+#include "core/boot_timing.h"
 #include "core/app_state.h"
 #include "core/battery.h"
 #include "core/common.hh"
@@ -1163,11 +1164,21 @@ void osd_update_element_positions() {
     }
 }
 
+static void fc_variant_apply(void);
+
 static void fc_osd_init(uint8_t fhd, uint16_t OFFSET_X, uint16_t OFFSET_Y) {
     uint8_t osd_width = fhd ? OSD_WIDTH_FHD : OSD_WIDTH_HD;
     uint8_t osd_height = fhd ? OSD_HEIGHT_FHD : OSD_HEIGHT_HD;
 
-    load_fc_osd_font(fhd);
+#ifdef HDZGOGGLE2
+    if (!g_init_done) {
+        fc_variant_apply(); // the glyphs load on a worker (osd_init)
+    } else
+#endif
+    {
+        load_fc_osd_font(fhd);
+        boot_mark(fhd ? "osd_font_fhd" : "osd_font_hd");
+    }
 
     for (int i = 0; i < HD_VMAX; i++) {
         for (int j = 0; j < HD_HMAX; j++) {
@@ -1201,6 +1212,36 @@ static void create_osd_scr(void) {
     }
 }
 
+#ifdef HDZGOGGLE2
+// Boot speed-up (G2): the FC OSD fonts (two BMP decodes, ~0.9 s) are only
+// drawn for HDZero, so at boot they load on a worker. The HDZero switch and
+// every later load_fc_osd_font() wait for it first (osd_fonts_wait).
+static pthread_t osd_font_tid;
+static bool osd_font_async = false;
+static pthread_mutex_t osd_font_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void fc_osd_font_files_load(uint8_t fhd);
+
+static void *thread_osd_fonts(void *arg) {
+    fc_osd_font_files_load(0);
+    boot_mark("osd_font_hd");
+    fc_osd_font_files_load(1);
+    boot_mark("osd_font_fhd");
+    return NULL;
+}
+#endif
+
+void osd_fonts_wait(void) {
+#ifdef HDZGOGGLE2
+    pthread_mutex_lock(&osd_font_wait_mutex);
+    if (osd_font_async) {
+        pthread_join(osd_font_tid, NULL);
+        osd_font_async = false;
+        boot_mark("osd_fonts_ready");
+    }
+    pthread_mutex_unlock(&osd_font_wait_mutex);
+#endif
+}
+
 int osd_init(void) {
     const uint16_t OFFSET_X = 20;
     const uint16_t OFFSET_Y = 40;
@@ -1215,7 +1256,9 @@ int osd_init(void) {
     create_osd_scr();
 
     fc_osd_init(0, OFFSET_X, OFFSET_Y);
+    boot_mark("osd_fc_hd");
     embedded_osd_init(0);
+    boot_mark("osd_embedded_hd");
 
 #if defined(HDZGOGGLE) || defined(HDZGOGGLE2)
     fc_osd_init(1, OFFSET_X + (OFFSET_X >> 1), OFFSET_Y + (OFFSET_Y >> 1));
@@ -1223,7 +1266,19 @@ int osd_init(void) {
     fc_osd_init(1, OFFSET_X, OFFSET_Y);
 #endif
 
+    boot_mark("osd_fc_fhd");
     embedded_osd_init(1);
+    boot_mark("osd_embedded_fhd");
+
+#ifdef HDZGOGGLE2
+    if (!g_init_done) {
+        osd_font_async = pthread_create(&osd_font_tid, NULL, thread_osd_fonts, NULL) == 0;
+        if (!osd_font_async) {
+            fc_osd_font_files_load(0);
+            fc_osd_font_files_load(1);
+        }
+    }
+#endif
 
     sem_init(&osd_semaphore, 0, 1);
 
@@ -1333,20 +1388,9 @@ int load_fc_osd_font_bmp(const char *file, uint8_t fhd) {
     return 0;
 }
 
-void load_fc_osd_font(uint8_t fhd) {
-    char fp[3][256];
-    int i;
-
-    if (fhd) {
-        snprintf(fp[0], sizeof(fp[0]), "%s/resource/OSD/FC/%s_FHD_000.bmp", path_extsd(), fc_variant);
-        snprintf(fp[1], sizeof(fp[1]), "%s/resource/OSD/FC/%s_FHD_000.bmp", path_app(), fc_variant);
-        snprintf(fp[2], sizeof(fp[2]), "%s/resource/OSD/FC/BTFL_FHD_000.bmp", path_app());
-    } else {
-        snprintf(fp[0], sizeof(fp[0]), "%s/resource/OSD/FC/%s_000.bmp", path_extsd(), fc_variant);
-        snprintf(fp[1], sizeof(fp[1]), "%s/resource/OSD/FC/%s_000.bmp", path_app(), fc_variant);
-        snprintf(fp[2], sizeof(fp[2]), "%s/resource/OSD/FC/BTFL_000.bmp", path_app());
-    }
-
+// The FC variant type and the clock offsets that go with it: cheap, and read
+// by the OSD labels osd_init() creates, so never deferred.
+static void fc_variant_apply(void) {
     // Optimized for runtime execution
     if (0 == strncmp(fc_variant, "ARDU", sizeof(fc_variant))) {
         g_fc_variant_type = FC_VARIANT_ARDU;
@@ -1380,6 +1424,22 @@ void load_fc_osd_font(uint8_t fhd) {
         clock_format_offsets[OSD_RESOURCE_1080] = 74;
         break;
     }
+}
+
+// The glyph bitmaps: the slow part (BMP read and decode).
+static void fc_osd_font_files_load(uint8_t fhd) {
+    char fp[3][256];
+    int i;
+
+    if (fhd) {
+        snprintf(fp[0], sizeof(fp[0]), "%s/resource/OSD/FC/%s_FHD_000.bmp", path_extsd(), fc_variant);
+        snprintf(fp[1], sizeof(fp[1]), "%s/resource/OSD/FC/%s_FHD_000.bmp", path_app(), fc_variant);
+        snprintf(fp[2], sizeof(fp[2]), "%s/resource/OSD/FC/BTFL_FHD_000.bmp", path_app());
+    } else {
+        snprintf(fp[0], sizeof(fp[0]), "%s/resource/OSD/FC/%s_000.bmp", path_extsd(), fc_variant);
+        snprintf(fp[1], sizeof(fp[1]), "%s/resource/OSD/FC/%s_000.bmp", path_app(), fc_variant);
+        snprintf(fp[2], sizeof(fp[2]), "%s/resource/OSD/FC/BTFL_000.bmp", path_app());
+    }
 
     for (i = 0; i < 3; i++) {
         if (!load_fc_osd_font_bmp(fp[i], fhd)) {
@@ -1388,6 +1448,12 @@ void load_fc_osd_font(uint8_t fhd) {
         } else
             LOGE(" failed!");
     }
+}
+
+void load_fc_osd_font(uint8_t fhd) {
+    osd_fonts_wait(); // never alongside the boot-time loader (G2)
+    fc_variant_apply();
+    fc_osd_font_files_load(fhd);
 }
 
 void osd_shadow_clear(void) {
@@ -1450,6 +1516,7 @@ void *thread_osd(void *ptr) {
     for (;;) {
         // wait for signal to render
         sem_wait(&osd_semaphore);
+        osd_fonts_wait(); // boot: glyphs may still be loading (G2)
 
         // clear shadow buffer when mode changes
         if (fhd_d != is_fhd) {

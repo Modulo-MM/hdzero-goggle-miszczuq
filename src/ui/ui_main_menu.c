@@ -36,6 +36,7 @@
 #include "ui/page_wifi.h"
 #include "ui/ui_image_setting.h"
 #include "ui/ui_keyboard.h"
+#include "core/boot_timing.h"
 #include "ui/ui_porting.h"
 #include "ui/ui_style.h"
 
@@ -354,8 +355,16 @@ void main_menu_init(void) {
 
     lv_obj_t *section = lv_menu_section_create(root_page);
 
+    // Boot timing: one mark per page, in page_packs order above.
+    static const char *const page_marks[] = {
+        "menu_p00", "menu_p01", "menu_p02", "menu_p03", "menu_p04", "menu_p05",
+        "menu_p06", "menu_p07", "menu_p08", "menu_p09", "menu_p10", "menu_p11",
+        "menu_p12", "menu_p13", "menu_p14", "menu_p15", "menu_p16", "menu_p17",
+        "menu_p18", "menu_p19", "menu_p20", "menu_p21", "menu_p22", "menu_p23"};
     for (uint32_t i = 0; i < page_packs_count; i++) {
         main_menu_create_entry(menu, section, page_packs[i]);
+        if (i < sizeof(page_marks) / sizeof(page_marks[0]))
+            boot_mark(page_marks[i]);
         if (page_packs[i]->post_bootup_run_priority > 0 && page_packs[i]->post_bootup_run_function != NULL) {
             post_bootup_actions[post_bootup_actions_count++] = page_packs[i];
         }

@@ -40,6 +40,40 @@ function sd_has_flash_files()
 		[ -e /mnt/extsd/HDZGOGGLE_VA.bin ] || [ -e /mnt/extsd/HDZGOGGLE_RX.bin ]
 }
 
+# Boot experiment (opt-in: <SD>/bootopt/analog_direct): the vdpo mode the
+# analog source will need when this boot enters it directly (the same choice
+# as start_running() in src/core/main.c), so it is set once instead of
+# 1080p50 first and the analog mode ~1.1 s later. 1080p50 otherwise.
+function boot_vdpo_mode()
+{
+	if [ ! -e /mnt/extsd/bootopt/analog_direct ]; then
+		echo 1080p50
+		return
+	fi
+	awk -F= '
+		/^\[/ { sec = $0; next }
+		sec == "[autoscan]" && $1 == "status" { st = $2 }
+		sec == "[autoscan]" && $1 == "source" { src = $2 }
+		sec == "[autoscan]" && $1 == "last_source" { last = $2 }
+		sec == "[autoscan]" && $1 == "load_from_boot" { lfb = $2 }
+		sec == "[source]" && $1 == "analog_format" { fmt = $2 }
+		END {
+			# Keys missing from setting.ini take the defaults of the app
+			# (g_setting_defaults): Auto Scan On, source HDZero, NTSC.
+			# The G2 never writes analog_format.
+			if (st == "") st = 0
+			if (src == "") src = 1
+			if (last == "") last = 0
+			if (fmt == "") fmt = 0
+			s = (src == 0) ? last : src
+			scan = (st == 0 && lfb != "true")
+			if (s == 3 || (s == 2 && !scan))
+				print (fmt == 1 ? "720p50" : "720p60")
+			else
+				print "1080p50"
+		}' /mnt/app/setting.ini 2>/dev/null || echo 1080p50
+}
+
 function config_uart_vdpo()
 {
 	setup_uart
@@ -50,12 +84,14 @@ function config_uart_vdpo()
 	# /tmp/vdpo_pending to go away before it touches the display (main.c).
 	# Not on a boot that flashes boot/FPGA/RX images from the SD card.
 	if [ $PLATFORM == "HDZGOGGLE2" ] && ! sd_has_flash_files; then
+		local mode=$(boot_vdpo_mode)
+		echo $mode > /tmp/vdpo_mode
 		: > /tmp/vdpo_pending
 		(
 			dispw -x
-			dispw -s vdpo 1080p50
+			dispw -s vdpo $mode
 			rm -f /tmp/vdpo_pending
-			bt vdpo_set
+			bt vdpo_set_$mode
 		) &
 		return
 	fi

@@ -45,6 +45,7 @@ SDL_mutex *global_sdl_mutex;
 #include "driver/it66121.h"
 #include "driver/mcp3021.h"
 #include "driver/rtc.h"
+#include "driver/rtc6715.h"
 #include "driver/screen.h"
 #include "driver/tp2825.h"
 #include "ui/page_power.h"
@@ -231,16 +232,29 @@ static void *thread_bmi270_init(void *arg) {
     return NULL;
 }
 
+// Boot experiment (bootopt/analog_early_rx): does this boot go straight to the
+// Built-in analog receiver? Same decision as start_running().
+static bool boot_enters_builtin_analog(void) {
+    int source = g_setting.autoscan.source == SETTING_AUTOSCAN_SOURCE_LAST ? g_setting.autoscan.last_source
+                                                                          : g_setting.autoscan.source;
+    bool boot_scan = g_setting.autoscan.status == SETTING_AUTOSCAN_STATUS_ON && !g_setting.autoscan.load_from_boot;
+    return source == SETTING_AUTOSCAN_SOURCE_AV_MODULE && !boot_scan &&
+           g_setting.source.analog_module == SETTING_SOURCES_ANALOG_MODULE_INTERNAL;
+}
+static bool analog_rx_early = false;
+
 // rc.sh sets the vdpo mode in the background on the G2 (~1.5 s in the
 // driver) and removes this file when done. Wait for it before touching the
 // display or the FPGA; capped, and a no-op with an rc.sh that doesn't do it.
 #define VDPO_PENDING_FILE "/tmp/vdpo_pending"
+#define VDPO_MODE_FILE    "/tmp/vdpo_mode"
 static void wait_for_vdpo(void) {
     for (int i = 0; i < 300 && access(VDPO_PENDING_FILE, F_OK) == 0; i++)
         usleep(10000);
     if (access(VDPO_PENDING_FILE, F_OK) == 0) {
         LOGE("vdpo still pending after 3 s, setting it here");
         system_exec("dispw -s vdpo 1080p50");
+        system_exec("echo 1080p50 > " VDPO_MODE_FILE);
         unlink(VDPO_PENDING_FILE);
     }
     boot_mark("vdpo_ready");
@@ -340,6 +354,13 @@ int main(int argc, char *argv[]) {
     hw_stat_init();
     boot_mark("hw_stat_init");
     device_init();
+#ifdef HDZGOGGLE2
+    if (boot_enters_builtin_analog() && boot_opt("analog_early_rx")) {
+        rtc6715_power_on_early();
+        analog_rx_early = true;
+        boot_mark("analog_rx_power_on");
+    }
+#endif
     esp32_init();
     boot_mark("esp32_init");
     elrs_init();
@@ -357,6 +378,11 @@ int main(int argc, char *argv[]) {
 #ifdef HDZGOGGLE2
     IT66021_init(); // its reset hold has been running since comm_init
     boot_mark("IT66021_init");
+    if (analog_rx_early) {
+        rtc6715_tune_early(g_setting.source.analog_channel - 1,
+                           g_setting.record.audio_source == SETTING_RECORD_AUDIO_SOURCE_AV_IN);
+        boot_mark("analog_rx_tuned");
+    }
 #endif
     statusbar_init();
     boot_mark("statusbar_init");

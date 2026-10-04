@@ -2,6 +2,7 @@
 
 #include <log/log.h>
 #include <minIni.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -83,6 +84,20 @@ void app_exit_menu() {
     }
 }
 
+#ifdef HDZGOGGLE2
+// Boot speed-up (G2): the audio routing is several audio_sel.sh runs, each a
+// shell plus a few amixer processes (~1-1.4 s in all), and the first video
+// frame does not need it. During the initial bring-up it runs on a worker;
+// dvr_mute/restore_live_audio wait for it (dvr_audio_route_lock).
+static void *thread_boot_audio_route(void *arg) {
+    dvr_select_audio_source(g_setting.record.audio_source);
+    dvr_enable_line_out(true);
+    dvr_audio_route_unlock();
+    boot_mark("av_audio_routed");
+    return NULL;
+}
+#endif
+
 void app_switch_to_analog(bool is_av_in) {
     boot_mark("switch_to_analog_begin");
     dvr_update_vi_conf(VR_720P50);
@@ -145,8 +160,23 @@ void app_switch_to_analog(bool is_av_in) {
     boot_mark("av_settings_saved");
 
     // audio in&out
-    dvr_select_audio_source(g_setting.record.audio_source);
-    dvr_enable_line_out(true);
+#ifdef HDZGOGGLE2
+    pthread_t audio_tid;
+    bool audio_async = false;
+    if (!g_init_done) {
+        dvr_audio_route_lock(); // released by the worker when done
+        audio_async = pthread_create(&audio_tid, NULL, thread_boot_audio_route, NULL) == 0;
+        if (audio_async)
+            pthread_detach(audio_tid);
+        else
+            dvr_audio_route_unlock();
+    }
+    if (!audio_async)
+#endif
+    {
+        dvr_select_audio_source(g_setting.record.audio_source);
+        dvr_enable_line_out(true);
+    }
 
     boot_mark("switch_to_analog_before_sleep");
 #ifdef HDZGOGGLE2
@@ -231,6 +261,7 @@ void app_switch_to_hdzero(bool is_default) {
     DM5680_clear_vldflg();
     DM5680_req_vldflg();
     boot_mark("hdzero_set_channel");
+    osd_fonts_wait(); // boot: the FC OSD fonts may still be loading (osd_init)
     progress_bar.start = 0;
 
 #if defined(HDZGOGGLE) || defined(HDZGOGGLE2)

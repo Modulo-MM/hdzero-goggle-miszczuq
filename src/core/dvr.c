@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -220,8 +221,32 @@ static void dvr_apply_record_audio_gain(uint8_t source) {
     }
 }
 
+// Taken for the boot-time audio routing worker (app_state.c) while it runs,
+// so a recording that starts meanwhile mutes live audio only after the
+// routing is complete (and is not unmuted by it). A semaphore, not a mutex:
+// it is taken on the main thread and released by the worker.
+static sem_t audio_route_sem;
+static pthread_once_t audio_route_once = PTHREAD_ONCE_INIT;
+
+static void audio_route_sem_init(void) {
+    sem_init(&audio_route_sem, 0, 1);
+}
+
+void dvr_audio_route_lock(void) {
+    pthread_once(&audio_route_once, audio_route_sem_init);
+    while (sem_wait(&audio_route_sem) != 0)
+        ; // EINTR
+}
+
+void dvr_audio_route_unlock(void) {
+    pthread_once(&audio_route_once, audio_route_sem_init);
+    sem_post(&audio_route_sem);
+}
+
 void dvr_mute_live_audio(void) {
     char buf[128];
+
+    dvr_audio_route_lock();
 
     // Unconditional on purpose: live_audio_line_out_enabled can go stale
     // (boot never sets it, and a source switch mid audio-test can desync it),
@@ -231,18 +256,20 @@ void dvr_mute_live_audio(void) {
     system_exec(buf);
     system_exec("amixer cset name='LINEINL/R to L_R output mixer gain' 0");
     live_audio_muted_for_dvr = true;
+    dvr_audio_route_unlock();
 }
 
 void dvr_restore_live_audio(void) {
     char buf[128];
 
-    if (!live_audio_muted_for_dvr || !live_audio_line_out_enabled)
-        return;
-
-    dvr_set_live_audio_volume(g_setting.record.live_audio_volume);
-    snprintf(buf, sizeof(buf), "%s out_linein_on", AUDIO_SEL_SH);
-    system_exec(buf);
-    live_audio_muted_for_dvr = false;
+    dvr_audio_route_lock();
+    if (live_audio_muted_for_dvr && live_audio_line_out_enabled) {
+        dvr_set_live_audio_volume(g_setting.record.live_audio_volume);
+        snprintf(buf, sizeof(buf), "%s out_linein_on", AUDIO_SEL_SH);
+        system_exec(buf);
+        live_audio_muted_for_dvr = false;
+    }
+    dvr_audio_route_unlock();
 }
 
 void dvr_select_audio_source(uint8_t source) {

@@ -25,6 +25,8 @@ void dvr_set_live_audio_volume(int volume);
 void dvr_set_mic_gain(int gain);
 void dvr_set_linein_gain(int gain);
 void dvr_mute_live_audio(void);
+void dvr_audio_route_lock(void);
+void dvr_audio_route_unlock(void);
 void dvr_restore_live_audio(void);
 void dvr_enable_line_out(bool enable);
 bool dvr_live_audio_is_enabled(void);

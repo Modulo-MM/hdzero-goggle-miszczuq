@@ -1,7 +1,9 @@
 #include "rtc6715.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <log/log.h>
@@ -70,7 +72,53 @@ static void rtc6715_audio(bool is_on) {
     LOGI("RTC6715 audio %s", is_on ? "on" : "off");
 }
 
+static void rtc6715_set_ch(int ch);
+
+#if defined(HDZGOGGLE2)
+// Boot experiment (G2, <SD>/bootopt/analog_early_rx): when the boot goes
+// straight to the Built-in receiver, main() powers it up during init and
+// tunes it once settled, so it already outputs video when the source switch
+// runs; that switch's rtc6715_init(1, ..) then skips the power-up and wait.
+#define RTC6715_POWER_SETTLE_US (200 * 1000)
+static bool early_powered = false;
+static struct timespec early_power_at;
+
+static void early_settle(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long us = (now.tv_sec - early_power_at.tv_sec) * 1000000L +
+              (now.tv_nsec - early_power_at.tv_nsec) / 1000;
+    if (us >= 0 && us < RTC6715_POWER_SETTLE_US)
+        usleep(RTC6715_POWER_SETTLE_US - us);
+}
+
+void rtc6715_power_on_early(void) {
+    gpadc_on(1);
+    DM5680_InternalAnalog_Power(1);
+    clock_gettime(CLOCK_MONOTONIC, &early_power_at);
+    early_powered = true;
+    LOGI("RTC6715 power on (early)");
+}
+
+void rtc6715_tune_early(int ch, bool audio_on) {
+    if (!early_powered)
+        return;
+    early_settle();
+    rtc6715_audio(audio_on);
+    rtc6715_set_ch(ch);
+}
+#endif
+
 static void rtc6715_init(bool power_on, bool audio_on) {
+#if defined(HDZGOGGLE2)
+    if (power_on && early_powered) {
+        early_powered = false; // later calls take the normal path
+        early_settle();
+        rtc6715_audio(audio_on);
+        return;
+    }
+    early_powered = false;
+#endif
 
     gpadc_on(power_on);
     rtc6715_power(power_on);

@@ -103,6 +103,7 @@ extern uint8_t channel_osd_preview_proto;
 extern uint8_t channel_osd_preview_band;
 
 int osd_init(void);
+void osd_fonts_wait(void);
 int osd_clear(void);
 void osd_fhd(uint8_t);
 void osd_signal_update();

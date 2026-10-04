@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <log/log.h>
@@ -548,6 +549,23 @@ void hw_screen_on(int bON) {
     pthread_mutex_unlock(&hardware_mutex);
 }
 
+// The vdpo mode rc.sh set at boot (/tmp/vdpo_mode): 1080p50, or the analog
+// mode under the analog_direct boot experiment (see rc.sh boot_vdpo_mode).
+static int boot_vdpo_tmg(void) {
+    char mode[16] = "";
+    FILE *fp = fopen("/tmp/vdpo_mode", "r");
+    if (fp) {
+        if (!fgets(mode, sizeof(mode), fp))
+            mode[0] = 0;
+        fclose(fp);
+    }
+    if (strncmp(mode, "720p50", 6) == 0)
+        return VDPO_TMG_720P50;
+    if (strncmp(mode, "720p60", 6) == 0)
+        return VDPO_TMG_720P60;
+    return VDPO_TMG_1080P50;
+}
+
 void Display_UI_init() {
     g_hw_stat.source_mode = SOURCE_MODE_UI;
     I2C_Write(ADDR_FPGA, 0x8C, 0x00);
@@ -555,9 +573,12 @@ void Display_UI_init() {
     // At boot rc.sh has just set vdpo to 1080p50; every vdpo mode set costs
     // ~1.1 s in the driver, so the initial bring-up skips the repeat
     // (hardware-tested). Later calls come from other modes and need it.
-    if (g_init_done)
+    if (g_init_done) {
         system_exec("dispw -s vdpo 1080p50");
-    g_hw_stat.vdpo_tmg = VDPO_TMG_1080P50;
+        g_hw_stat.vdpo_tmg = VDPO_TMG_1080P50;
+    } else {
+        g_hw_stat.vdpo_tmg = boot_vdpo_tmg();
+    }
     system_exec("aww 0x0300b340 0x00000008");
     Display_VO_SWITCH(0);
 
@@ -804,12 +825,19 @@ int HDZERO_detect() // return = 1: vtmg to V536 changed
 }
 
 void AV_Mode_Switch_fpga(int is_pal) {
+    // At boot rc.sh may already have set this exact mode (analog_direct boot
+    // experiment); every vdpo mode set costs ~1.1 s, so don't repeat it then.
+    const int tmg = is_pal ? VDPO_TMG_720P50 : VDPO_TMG_720P60;
+    const bool already_set = !g_init_done && g_hw_stat.vdpo_tmg == tmg;
+
     if (is_pal) {
-        system_exec("dispw -s vdpo 720p50");
+        if (!already_set)
+            system_exec("dispw -s vdpo 720p50");
         g_hw_stat.vdpo_tmg = VDPO_TMG_720P50;
         I2C_Write(ADDR_FPGA, 0x80, 0x10);
     } else {
-        system_exec("dispw -s vdpo 720p60");
+        if (!already_set)
+            system_exec("dispw -s vdpo 720p60");
         g_hw_stat.vdpo_tmg = VDPO_TMG_720P60;
         I2C_Write(ADDR_FPGA, 0x80, 0x00);
     }
