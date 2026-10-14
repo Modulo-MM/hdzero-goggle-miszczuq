@@ -23,6 +23,7 @@
 #include "core/dvr.h"
 #include "core/elrs.h"
 #include "core/msp_displayport.h"
+#include "core/perf_monitor.h"
 #include "core/scan_core.h"
 #include "core/settings.h"
 #include "platform/paths.h"
@@ -38,6 +39,7 @@
 #include "ui/page_fans.h"
 #include "ui/page_scannow.h"
 #include "ui/ui_image_setting.h"
+#include "ui/ui_lazy.h"
 #include "ui/ui_porting.h"
 
 extern const lv_font_t conthrax_26;
@@ -87,15 +89,56 @@ static void osd_gif_set_src_cached(lv_obj_t *obj, char *cache, size_t cache_len,
 }
 
 // Use SDCARD for Embedded Glyph if the glyph exists otherwise use goggle FS
+//
+// lazy_ui (perf_opt): resolved paths are cached. The OSD update resolves
+// every element on every main-loop pass, each an access() on the SD card
+// (~1700 a second in HDZero video), and the answer changes only with the
+// card: entries expire when its mount state changes and after
+// OSD_PATH_CACHE_MS (a card reformatted in place keeps its mount state).
+#define OSD_PATH_CACHE_SLOTS 64
+#define OSD_PATH_CACHE_MS    5000
+
+typedef struct {
+    bool valid;
+    uint8_t type;
+    char filename[48];
+    char path[128];
+} osd_path_cache_t;
+
+static osd_path_cache_t osd_path_cache[OSD_PATH_CACHE_SLOTS];
+static pthread_mutex_t osd_path_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 void osd_resource_path(char *buf, const char *fmt, osd_resource_t osd_resource_type, ...) {
     char filename[128];
-    char buf2[128];
 
     va_list args;
     va_start(args, osd_resource_type);
     vsnprintf(filename, sizeof(filename), fmt, args);
     va_end(args);
-    strcpy(buf2, buf);
+
+    osd_path_cache_t *slot = NULL;
+    if (perf_opt.lazy_ui && strlen(filename) < sizeof(slot->filename)) {
+        static uint32_t cache_time = 0;
+        static bool cache_sdcard = false;
+
+        pthread_mutex_lock(&osd_path_cache_mutex);
+        if (cache_sdcard != g_sdcard_enable || lv_tick_elaps(cache_time) >= OSD_PATH_CACHE_MS) {
+            memset(osd_path_cache, 0, sizeof(osd_path_cache));
+            cache_sdcard = g_sdcard_enable;
+            cache_time = lv_tick_get();
+        }
+        uint32_t hash = osd_resource_type;
+        for (const char *p = filename; *p; p++)
+            hash = hash * 31 + (uint8_t)*p;
+        slot = &osd_path_cache[hash % OSD_PATH_CACHE_SLOTS];
+        if (slot->valid && slot->type == osd_resource_type && strcmp(slot->filename, filename) == 0) {
+            strcpy(buf, slot->path);
+            pthread_mutex_unlock(&osd_path_cache_mutex);
+            return;
+        }
+        pthread_mutex_unlock(&osd_path_cache_mutex);
+    }
+
     strcpy(buf, path_extsd());
     strcat(buf, "/resource/OSD/GOGGLE/");
 
@@ -105,7 +148,6 @@ void osd_resource_path(char *buf, const char *fmt, osd_resource_t osd_resource_t
     strcat(buf, filename);
 
     if (access(buf, F_OK) != 0) {
-        strcpy(buf, buf2);
         strcpy(buf, path_app());
         strcat(buf, "/resource/OSD/GOGGLE/");
         if (osd_resource_type == OSD_RESOURCE_1080) {
@@ -117,6 +159,15 @@ void osd_resource_path(char *buf, const char *fmt, osd_resource_t osd_resource_t
     memmove(buf + 2, buf, strlen(buf) + 2);
     buf[0] = 'A';
     buf[1] = ':';
+
+    if (slot && strlen(buf) < sizeof(slot->path)) {
+        pthread_mutex_lock(&osd_path_cache_mutex);
+        slot->valid = true;
+        slot->type = osd_resource_type;
+        strcpy(slot->filename, filename);
+        strcpy(slot->path, buf);
+        pthread_mutex_unlock(&osd_path_cache_mutex);
+    }
 }
 
 void osd_toggle() {
@@ -182,41 +233,80 @@ static lv_obj_t *analog_rssi_bar;
 bool osd_element_preview_analog = false;
 #endif
 
+// lazy_ui (perf_opt): an lv_gif decodes frames on its own timer, re-reading
+// the file in small pieces, whether or not it is on screen, and the
+// low-battery and VRX-overheat GIFs (one per resolution) are hidden nearly
+// always. The 1080p ones are single frames with a 0 ms delay, which lv_gif
+// redecodes on every 10 ms tick. Run the timers only while the GIF is
+// visible, and pace 0 ms frames at 100 ms (what browsers do with them).
+#define OSD_GIF_ZERO_DELAY_PERIOD_MS 100
+#define OSD_GIF_DEFAULT_PERIOD_MS    10 // lv_gif's own timer period
+
+static void osd_gif_timers_sync(void) {
+    static bool paused_here[4];
+
+    if (!perf_opt.lazy_ui)
+        return;
+    lv_obj_t *gifs[4] = {g_osd_hdzero.battery_low[0], g_osd_hdzero.battery_low[1],
+                         g_osd_hdzero.vrx_temp[0], g_osd_hdzero.vrx_temp[1]};
+    for (int i = 0; i < 4; i++) {
+        lv_gif_t *gif = (lv_gif_t *)gifs[i];
+        if (!gif || !gif->timer)
+            continue;
+        if (!lv_obj_is_visible(gifs[i])) {
+            if (!gif->timer->paused) {
+                lv_timer_pause(gif->timer);
+                paused_here[i] = true;
+            }
+            continue;
+        }
+        if (!gif->gif)
+            continue; // no source: lv_gif keeps its timer paused itself
+        uint32_t period = gif->gif->gce.delay ? OSD_GIF_DEFAULT_PERIOD_MS : OSD_GIF_ZERO_DELAY_PERIOD_MS;
+        if (gif->timer->period != period)
+            lv_timer_set_period(gif->timer, period);
+        if (paused_here[i]) {
+            paused_here[i] = false;
+            lv_timer_resume(gif->timer);
+        }
+    }
+}
+
 void osd_llock_show(bool bShow) {
     char buf[128];
 
     if (!bShow || !g_setting.osd.element[OSD_GOGGLE_LATENCY_LOCK].show) {
-        lv_obj_add_flag(g_osd_hdzero.latency_lock[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.latency_lock[is_fhd], true);
         return;
     }
 
     if (g_latency_locked) {
         osd_resource_path(buf, "%s", is_fhd, LLOCK_bmp);
-        lv_img_set_src(g_osd_hdzero.latency_lock[is_fhd], buf);
-        lv_obj_clear_flag(g_osd_hdzero.latency_lock[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_img_set_src(g_osd_hdzero.latency_lock[is_fhd], buf);
+        lazy_hidden(g_osd_hdzero.latency_lock[is_fhd], false);
     } else
-        lv_obj_add_flag(g_osd_hdzero.latency_lock[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.latency_lock[is_fhd], true);
 }
 
 void osd_rec_show(bool bShow) {
     char buf[128];
 
     if (!bShow || !g_setting.osd.element[OSD_GOGGLE_SD_REC].show) {
-        lv_obj_add_flag(g_osd_hdzero.sd_rec[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.sd_rec[is_fhd], true);
         return;
     }
 
     if (!g_sdcard_enable || !g_sdcard_ready) {
         osd_resource_path(buf, "%s", is_fhd, noSdcard_bmp);
-        lv_img_set_src(g_osd_hdzero.sd_rec[is_fhd], buf);
-        lv_obj_clear_flag(g_osd_hdzero.sd_rec[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_img_set_src(g_osd_hdzero.sd_rec[is_fhd], buf);
+        lazy_hidden(g_osd_hdzero.sd_rec[is_fhd], false);
     } else {
         if (dvr_is_recording) {
             osd_resource_path(buf, "%s", is_fhd, recording_bmp);
-            lv_img_set_src(g_osd_hdzero.sd_rec[is_fhd], buf);
-            lv_obj_clear_flag(g_osd_hdzero.sd_rec[is_fhd], LV_OBJ_FLAG_HIDDEN);
+            lazy_img_set_src(g_osd_hdzero.sd_rec[is_fhd], buf);
+            lazy_hidden(g_osd_hdzero.sd_rec[is_fhd], false);
         } else
-            lv_obj_add_flag(g_osd_hdzero.sd_rec[is_fhd], LV_OBJ_FLAG_HIDDEN);
+            lazy_hidden(g_osd_hdzero.sd_rec[is_fhd], true);
     }
 #if defined(HDZGOGGLE) || defined(HDZGOGGLE2)
     osd_hdmi_in_dvr_update();
@@ -226,7 +316,7 @@ void osd_rec_show(bool bShow) {
 void osd_battery_low_show() {
     char buf[128];
     if (g_setting.power.warning_type == SETTING_POWER_WARNING_TYPE_BEEP) { // Beep only
-        lv_obj_add_flag(g_osd_hdzero.battery_low[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_low[is_fhd], true);
         return;
     }
 
@@ -244,9 +334,9 @@ void osd_battery_low_show() {
         osd_resource_path(buf, "%s", is_fhd, lowBattery_gif);
         osd_gif_set_src_cached(g_osd_hdzero.battery_low[is_fhd], osd_gif_src_battery_low[is_fhd],
                                sizeof(osd_gif_src_battery_low[is_fhd]), buf);
-        lv_obj_clear_flag(g_osd_hdzero.battery_low[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_low[is_fhd], false);
     } else
-        lv_obj_add_flag(g_osd_hdzero.battery_low[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_low[is_fhd], true);
 }
 
 void osd_battery_voltage_show(bool bShow) {
@@ -257,71 +347,83 @@ void osd_battery_voltage_show(bool bShow) {
     // per-element OSD show setting.
     if (!g_setting.osd.element[OSD_GOGGLE_BATTERY_VOLTAGE].show ||
         (!bShow && lvl != BATTERY_WARN_CRITICAL)) {
-        lv_obj_add_flag(g_osd_hdzero.battery_voltage[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_voltage[is_fhd], true);
         return;
     }
     char buf[128];
 
     battery_get_voltage_str(buf);
-    lv_label_set_text(g_osd_hdzero.battery_voltage[is_fhd], buf);
+    lazy_label_set_text(g_osd_hdzero.battery_voltage[is_fhd], buf);
 
     bool crit_blink = false;
     if (is_gradual) {
         if (lvl == BATTERY_WARN_SUBTLE)
-            lv_obj_set_style_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 191, 0), 0); // amber
+            lazy_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 191, 0)); // amber
         else if (lvl == BATTERY_WARN_SLOW)
-            lv_obj_set_style_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 128, 0), 0); // orange
+            lazy_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 128, 0)); // orange
         else if (lvl == BATTERY_WARN_RAPID)
-            lv_obj_set_style_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 0, 0), 0); // red
+            lazy_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 0, 0)); // red
         else if (lvl == BATTERY_WARN_CRITICAL)
-            lv_obj_set_style_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(220, 0, 0), 0); // dark red
+            lazy_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(220, 0, 0)); // dark red
         else
-            lv_obj_set_style_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 255, 255), 0);
+            lazy_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 255, 255));
         // critical blinks the voltage text to mirror the menu (400 ms phase)
         crit_blink = (lvl == BATTERY_WARN_CRITICAL) && ((lv_tick_get() / 400) % 2);
     } else if (battery_is_low()) {
-        lv_obj_set_style_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 0, 0), 0);
+        lazy_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 0, 0));
     } else {
-        lv_obj_set_style_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 255, 255), 0);
+        lazy_text_color(g_osd_hdzero.battery_voltage[is_fhd], lv_color_make(255, 255, 255));
     }
 
     if (crit_blink)
-        lv_obj_add_flag(g_osd_hdzero.battery_voltage[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_voltage[is_fhd], true);
     else
-        lv_obj_clear_flag(g_osd_hdzero.battery_voltage[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_voltage[is_fhd], false);
 }
 
 void osd_clock_date_show(bool bShow) {
     if (!bShow || !g_setting.osd.element[OSD_GOGGLE_CLOCK_DATE].show) {
-        lv_obj_add_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], true);
         return;
     }
 
-    lv_label_set_text(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], clock_date);
-    lv_obj_set_style_text_color(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], lv_color_make(255, 255, 255), 0);
-    lv_obj_clear_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], LV_OBJ_FLAG_HIDDEN);
+    lazy_label_set_text(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], clock_date);
+    lazy_text_color(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], lv_color_make(255, 255, 255));
+    lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], false);
 }
 
 void osd_clock_time_show(bool bShow) {
     if (!bShow || !g_setting.osd.element[OSD_GOGGLE_CLOCK_TIME].show) {
-        lv_obj_add_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], true);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], true);
         return;
     }
 
-    lv_label_set_text(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], clock_time);
-    lv_label_set_text(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], clock_format);
-    lv_obj_set_style_text_color(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_text_color(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], lv_color_make(255, 255, 255), 0);
-    lv_obj_clear_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], LV_OBJ_FLAG_HIDDEN);
+    lazy_label_set_text(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], clock_time);
+    lazy_label_set_text(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], clock_format);
+    lazy_text_color(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], lv_color_make(255, 255, 255));
+    lazy_text_color(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], lv_color_make(255, 255, 255));
+    lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], false);
+    lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], false);
 }
 
+// lazy_ui (perf_opt): re-read the clock every OSD_CLOCK_READ_MS (as the
+// Clock page does) rather than on every main-loop pass: each read opens and
+// queries up to four /dev/rtc nodes, and the text changes once a second.
+#define OSD_CLOCK_READ_MS 250
+
 void osd_clock_show(bool bShow) {
+    static uint32_t last_read = 0;
+    static bool have_read = false;
+
     // Update clock
-    rtc_get_clock_osd_str(clock_date, sizeof(clock_date),
-                          clock_time, sizeof(clock_time),
-                          clock_format, sizeof(clock_format));
+    if (!perf_opt.lazy_ui || !have_read || lv_tick_elaps(last_read) >= OSD_CLOCK_READ_MS) {
+        rtc_get_clock_osd_str(clock_date, sizeof(clock_date),
+                              clock_time, sizeof(clock_time),
+                              clock_format, sizeof(clock_format));
+        last_read = lv_tick_get();
+        have_read = true;
+    }
 
     osd_clock_date_show(bShow);
     osd_clock_time_show(bShow);
@@ -330,15 +432,15 @@ void osd_clock_show(bool bShow) {
 void osd_topfan_show(bool bShow) {
     char buf[128];
     if (!bShow || !g_setting.osd.element[OSD_GOGGLE_TOPFAN_SPEED].show) {
-        lv_obj_add_flag(g_osd_hdzero.topfan_speed[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.topfan_speed[is_fhd], true);
         return;
     }
 
     if (g_setting.fans.top_speed > 5)
         return;
     osd_resource_path(buf, "fan%d.bmp", is_fhd, fan_speed.top);
-    lv_img_set_src(g_osd_hdzero.topfan_speed[is_fhd], buf);
-    lv_obj_clear_flag(g_osd_hdzero.topfan_speed[is_fhd], LV_OBJ_FLAG_HIDDEN);
+    lazy_img_set_src(g_osd_hdzero.topfan_speed[is_fhd], buf);
+    lazy_hidden(g_osd_hdzero.topfan_speed[is_fhd], false);
 }
 
 void osd_vrxtemp_show() {
@@ -347,15 +449,15 @@ void osd_vrxtemp_show() {
         osd_resource_path(buf, "%s", is_fhd, VrxTemp7_gif);
         osd_gif_set_src_cached(g_osd_hdzero.vrx_temp[is_fhd], osd_gif_src_vrx_temp[is_fhd],
                                sizeof(osd_gif_src_vrx_temp[is_fhd]), buf);
-        lv_obj_clear_flag(g_osd_hdzero.vrx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vrx_temp[is_fhd], false);
     } else
-        lv_obj_add_flag(g_osd_hdzero.vrx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vrx_temp[is_fhd], true);
 }
 
 void osd_vlq_show(bool bShow) {
     char buf[128];
     if (!bShow || !g_setting.osd.element[OSD_GOGGLE_VLQ].show) {
-        lv_obj_add_flag(g_osd_hdzero.vlq[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vlq[is_fhd], true);
         return;
     }
 
@@ -367,8 +469,8 @@ void osd_vlq_show(bool bShow) {
         osd_resource_path(buf, "%s", is_fhd, "VLQ1.bmp");
     }
 
-    lv_img_set_src(g_osd_hdzero.vlq[is_fhd], buf);
-    lv_obj_clear_flag(g_osd_hdzero.vlq[is_fhd], LV_OBJ_FLAG_HIDDEN);
+    lazy_img_set_src(g_osd_hdzero.vlq[is_fhd], buf);
+    lazy_hidden(g_osd_hdzero.vlq[is_fhd], false);
 }
 
 void osd_analog_rssi_update_location() {
@@ -396,7 +498,7 @@ void osd_analog_rssi_create() {
     lv_obj_set_style_border_color(analog_rssi_bar, lv_color_hex(0x202020), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(analog_rssi_bar, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-    lv_obj_add_flag(analog_rssi_bar, LV_OBJ_FLAG_HIDDEN);
+    lazy_hidden(analog_rssi_bar, true);
 
     pthread_mutex_unlock(&lvgl_mutex);
 }
@@ -406,11 +508,11 @@ void osd_analog_rssi_show(bool bShow) {
     // static uint8_t cnt = 0;
 
     if (!bShow || !g_setting.osd.element[OSD_GOGGLE_ANALOG_RSSI].show) {
-        lv_obj_add_flag(analog_rssi_bar, LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(analog_rssi_bar, true);
         return;
     }
 
-    lv_obj_clear_flag(analog_rssi_bar, LV_OBJ_FLAG_HIDDEN);
+    lazy_hidden(analog_rssi_bar, false);
 
     int rssi_volt_mv;
 
@@ -505,10 +607,10 @@ void osd_channel_show(bool bShow) {
     // "Detecting..." status in the same style as the red "To R1/Dual?"
     // preview, and keep it up until osd_detecting_show(false) drops the flag.
     if (osd_detecting) {
-        lv_label_set_text(g_osd_hdzero.channel[is_fhd], "  Detecting...  ");
-        lv_obj_set_style_text_color(g_osd_hdzero.channel[is_fhd], lv_color_make(0xFF, 0x20, 0x20), 0);
-        lv_obj_set_style_bg_opa(g_osd_hdzero.channel[is_fhd], LV_OPA_100, 0);
-        lv_obj_clear_flag(g_osd_hdzero.channel[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_label_set_text(g_osd_hdzero.channel[is_fhd], "  Detecting...  ");
+        lazy_text_color(g_osd_hdzero.channel[is_fhd], lv_color_make(0xFF, 0x20, 0x20));
+        lazy_bg_opa(g_osd_hdzero.channel[is_fhd], LV_OPA_100);
+        lazy_hidden(g_osd_hdzero.channel[is_fhd], false);
         return;
     }
 
@@ -542,7 +644,7 @@ void osd_channel_show(bool bShow) {
             snprintf(buf, sizeof(buf), "  To %s?  ",
                      channel2str(preview_is_hdz, preview_band, ch));
         }
-        lv_obj_set_style_bg_opa(g_osd_hdzero.channel[is_fhd], LV_OPA_100, 0);
+        lazy_bg_opa(g_osd_hdzero.channel[is_fhd], LV_OPA_100);
     } else {
         if (g_source_info.source == SOURCE_HDZERO) {
             ch = g_setting.scan.channel & 0x7F;
@@ -574,16 +676,16 @@ void osd_channel_show(bool bShow) {
         if (bShow) {
             color = lv_color_make(0xFF, 0xFF, 0xFF);
             snprintf(buf, sizeof(buf), "CH:%s", channel2str(g_source_info.source == SOURCE_HDZERO, g_setting.source.hdzero_band, ch));
-            lv_obj_set_style_bg_opa(g_osd_hdzero.channel[is_fhd], 0, 0);
+            lazy_bg_opa(g_osd_hdzero.channel[is_fhd], 0);
         }
     }
 
     if (channel_osd_mode & 0x80 || (bShow && channel_osd_mode && g_setting.osd.element[OSD_GOGGLE_CHANNEL].show)) {
-        lv_label_set_text(g_osd_hdzero.channel[is_fhd], buf);
-        lv_obj_set_style_text_color(g_osd_hdzero.channel[is_fhd], color, 0);
-        lv_obj_clear_flag(g_osd_hdzero.channel[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_label_set_text(g_osd_hdzero.channel[is_fhd], buf);
+        lazy_text_color(g_osd_hdzero.channel[is_fhd], color);
+        lazy_hidden(g_osd_hdzero.channel[is_fhd], false);
     } else {
-        lv_obj_add_flag(g_osd_hdzero.channel[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.channel[is_fhd], true);
     }
 
     // This confirmation is independent of the channel OSD visibility toggle.
@@ -593,19 +695,19 @@ void osd_channel_show(bool bShow) {
         uint8_t const sent_channel = (is_hdz ? g_setting.scan.channel
                                              : g_setting.source.analog_channel) & 0x7F;
         if (g_setting.elrs.vtx_sent_style == SETTING_VTX_SENT_STYLE_SUBTLE) {
-            lv_label_set_text(g_osd_hdzero.vtx_sent[is_fhd], "VTX SENT");
-            lv_obj_set_style_bg_opa(g_osd_hdzero.vtx_sent[is_fhd], LV_OPA_TRANSP, 0);
-            lv_obj_set_style_text_color(g_osd_hdzero.vtx_sent[is_fhd], lv_color_make(0x00, 0xB0, 0x00), 0);
+            lazy_label_set_text(g_osd_hdzero.vtx_sent[is_fhd], "VTX SENT");
+            lazy_bg_opa(g_osd_hdzero.vtx_sent[is_fhd], LV_OPA_TRANSP);
+            lazy_text_color(g_osd_hdzero.vtx_sent[is_fhd], lv_color_make(0x00, 0xB0, 0x00));
         } else {
             snprintf(buf, sizeof(buf), "  %s  VTX SENT  ",
                      channel2str(is_hdz, g_setting.source.hdzero_band, sent_channel));
-            lv_label_set_text(g_osd_hdzero.vtx_sent[is_fhd], buf);
-            lv_obj_set_style_bg_opa(g_osd_hdzero.vtx_sent[is_fhd], LV_OPA_100, 0);
-            lv_obj_set_style_text_color(g_osd_hdzero.vtx_sent[is_fhd], lv_color_make(0x00, 0xFF, 0x00), 0);
+            lazy_label_set_text(g_osd_hdzero.vtx_sent[is_fhd], buf);
+            lazy_bg_opa(g_osd_hdzero.vtx_sent[is_fhd], LV_OPA_100);
+            lazy_text_color(g_osd_hdzero.vtx_sent[is_fhd], lv_color_make(0x00, 0xFF, 0x00));
         }
-        lv_obj_clear_flag(g_osd_hdzero.vtx_sent[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vtx_sent[is_fhd], false);
     } else {
-        lv_obj_add_flag(g_osd_hdzero.vtx_sent[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vtx_sent[is_fhd], true);
     }
 }
 
@@ -740,100 +842,100 @@ bool fhd_change() {
 
 void osd_show_all_elements() {
     if (g_setting.osd.element[OSD_GOGGLE_CLOCK_DATE].show)
-        lv_obj_clear_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_DATE], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_CLOCK_TIME].show) {
-        lv_obj_clear_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], false);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], false);
     } else {
-        lv_obj_add_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_TIME], true);
+        lazy_hidden(g_osd_hdzero.clock[is_fhd][OSD_CLOCK_FORMAT], true);
     }
 
     if (g_setting.osd.element[OSD_GOGGLE_TOPFAN_SPEED].show)
-        lv_obj_clear_flag(g_osd_hdzero.topfan_speed[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.topfan_speed[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.topfan_speed[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.topfan_speed[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_BATTERY_LOW].show)
-        lv_obj_clear_flag(g_osd_hdzero.battery_low[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_low[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.battery_low[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_low[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_BATTERY_VOLTAGE].show)
-        lv_obj_clear_flag(g_osd_hdzero.battery_voltage[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_voltage[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.battery_voltage[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.battery_voltage[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_VTX_TEMP].show)
-        lv_obj_clear_flag(g_osd_hdzero.vtx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vtx_temp[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.vtx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vtx_temp[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_VRX_TEMP].show)
-        lv_obj_clear_flag(g_osd_hdzero.vrx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vrx_temp[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.vrx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vrx_temp[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_LATENCY_LOCK].show)
-        lv_obj_clear_flag(g_osd_hdzero.latency_lock[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.latency_lock[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.latency_lock[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.latency_lock[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_CHANNEL].show)
-        lv_obj_clear_flag(g_osd_hdzero.channel[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.channel[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.channel[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.channel[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_SD_REC].show)
-        lv_obj_clear_flag(g_osd_hdzero.sd_rec[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.sd_rec[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.sd_rec[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.sd_rec[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_VLQ].show)
-        lv_obj_clear_flag(g_osd_hdzero.vlq[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vlq[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.vlq[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vlq[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_ANT0].show)
-        lv_obj_clear_flag(g_osd_hdzero.ant0[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant0[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.ant0[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant0[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_ANT1].show)
-        lv_obj_clear_flag(g_osd_hdzero.ant1[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant1[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.ant1[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant1[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_ANT2].show)
-        lv_obj_clear_flag(g_osd_hdzero.ant2[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant2[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.ant2[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant2[is_fhd], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_ANT3].show)
-        lv_obj_clear_flag(g_osd_hdzero.ant3[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant3[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.ant3[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant3[is_fhd], true);
 
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2)
     if (osd_element_preview_analog) {
         // analog source: HDZero-only elements are not drawn
-        lv_obj_add_flag(g_osd_hdzero.vtx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(g_osd_hdzero.vlq[is_fhd], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(g_osd_hdzero.ant0[is_fhd], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(g_osd_hdzero.ant1[is_fhd], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(g_osd_hdzero.ant2[is_fhd], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(g_osd_hdzero.ant3[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vtx_temp[is_fhd], true);
+        lazy_hidden(g_osd_hdzero.vlq[is_fhd], true);
+        lazy_hidden(g_osd_hdzero.ant0[is_fhd], true);
+        lazy_hidden(g_osd_hdzero.ant1[is_fhd], true);
+        lazy_hidden(g_osd_hdzero.ant2[is_fhd], true);
+        lazy_hidden(g_osd_hdzero.ant3[is_fhd], true);
     }
 
     if (osd_element_preview_analog && g_setting.osd.element[OSD_GOGGLE_ANALOG_RSSI].show) {
         // dummy value so the bar is visible while positioning
         lv_bar_set_value(analog_rssi_bar, 75, LV_ANIM_OFF);
-        lv_obj_clear_flag(analog_rssi_bar, LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(analog_rssi_bar, false);
     } else {
-        lv_obj_add_flag(analog_rssi_bar, LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(analog_rssi_bar, true);
     }
 #endif
 
@@ -841,20 +943,20 @@ void osd_show_all_elements() {
         return;
 
     if (g_setting.osd.element[OSD_GOGGLE_TEMP_TOP].show)
-        lv_obj_clear_flag(g_osd_hdzero.osd_tempe[is_fhd][0], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.osd_tempe[is_fhd][0], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.osd_tempe[is_fhd][0], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.osd_tempe[is_fhd][0], true);
 
 #if defined(HDZGOGGLE) || defined(HDZGOGGLE2)
     if (g_setting.osd.element[OSD_GOGGLE_TEMP_LEFT].show)
-        lv_obj_clear_flag(g_osd_hdzero.osd_tempe[is_fhd][1], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.osd_tempe[is_fhd][1], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.osd_tempe[is_fhd][1], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.osd_tempe[is_fhd][1], true);
 
     if (g_setting.osd.element[OSD_GOGGLE_TEMP_RIGHT].show)
-        lv_obj_clear_flag(g_osd_hdzero.osd_tempe[is_fhd][2], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.osd_tempe[is_fhd][2], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.osd_tempe[is_fhd][2], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.osd_tempe[is_fhd][2], true);
 #elif defined(HDZBOXPRO)
 
 #endif
@@ -864,39 +966,50 @@ void osd_elements_set_dummy_sources() {
     char buf[128];
 
     osd_resource_path(buf, "%s", is_fhd, VtxTemp1_bmp);
-    lv_img_set_src(g_osd_hdzero.vtx_temp[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.vtx_temp[is_fhd], buf);
 
     osd_resource_path(buf, "%s", is_fhd, ant2_bmp);
-    lv_img_set_src(g_osd_hdzero.ant0[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.ant0[is_fhd], buf);
 
     osd_resource_path(buf, "%s", is_fhd, ant3_bmp);
-    lv_img_set_src(g_osd_hdzero.ant1[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.ant1[is_fhd], buf);
 
     osd_resource_path(buf, "%s", is_fhd, ant4_bmp);
-    lv_img_set_src(g_osd_hdzero.ant2[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.ant2[is_fhd], buf);
 
     osd_resource_path(buf, "%s", is_fhd, ant5_bmp);
-    lv_img_set_src(g_osd_hdzero.ant3[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.ant3[is_fhd], buf);
 
     osd_resource_path(buf, "%s", is_fhd, recording_bmp);
-    lv_img_set_src(g_osd_hdzero.sd_rec[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.sd_rec[is_fhd], buf);
 
     osd_resource_path(buf, "%s", is_fhd, VLQ9_bmp);
-    lv_img_set_src(g_osd_hdzero.vlq[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.vlq[is_fhd], buf);
 
     osd_resource_path(buf, "%s", is_fhd, fan5_bmp);
-    lv_img_set_src(g_osd_hdzero.topfan_speed[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.topfan_speed[is_fhd], buf);
 }
 
-#define FC_OSD_CHECK_PERIOD 200 // 25ms
+// The FC OSD is cleared after FC_OSD_CHECK_PERIOD steps of
+// FC_OSD_CHECK_STEP_MS (~15 s) without an OSD packet. The steps were
+// main-loop passes, ~75 ms each while every pass redrew the whole screen;
+// counting passes now would clear it after ~1 s of silence.
+#define FC_OSD_CHECK_PERIOD  200
+#define FC_OSD_CHECK_STEP_MS 75
 void osd_hdzero_update(void) {
     char buf[128], i;
 
-    if (g_osd_update_cnt < FC_OSD_CHECK_PERIOD)
-        g_osd_update_cnt++;
-    else if (g_osd_update_cnt == FC_OSD_CHECK_PERIOD) {
-        osd_clear();
-        g_osd_update_cnt++;
+    osd_gif_timers_sync();
+
+    static uint32_t fc_osd_check_step = 0;
+    if (lv_tick_elaps(fc_osd_check_step) >= FC_OSD_CHECK_STEP_MS) {
+        fc_osd_check_step = lv_tick_get();
+        if (g_osd_update_cnt < FC_OSD_CHECK_PERIOD)
+            g_osd_update_cnt++;
+        else if (g_osd_update_cnt == FC_OSD_CHECK_PERIOD) {
+            osd_clear();
+            g_osd_update_cnt++;
+        }
     }
 
     if (fhd_change())
@@ -953,13 +1066,13 @@ void osd_hdzero_update(void) {
         } else {
             osd_resource_path(buf, "%s", is_fhd, blank_bmp);
         }
-        lv_img_set_src(g_osd_hdzero.vtx_temp[is_fhd], buf);
+        lazy_img_set_src(g_osd_hdzero.vtx_temp[is_fhd], buf);
     }
 
     if (showRXOSD && source_is_hdzero && g_setting.osd.element[OSD_GOGGLE_VTX_TEMP].show)
-        lv_obj_clear_flag(g_osd_hdzero.vtx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vtx_temp[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.vtx_temp[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.vtx_temp[is_fhd], true);
 
     osd_channel_show(showRXOSD);
     osd_vlq_show(showRXOSD && source_is_hdzero);
@@ -984,46 +1097,46 @@ void osd_hdzero_update(void) {
     }
 
     osd_resource_path(buf, "ant%d.bmp", is_fhd, RSSI2Ant(rx_status[0].rx_rssi[1]));
-    lv_img_set_src(g_osd_hdzero.ant0[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.ant0[is_fhd], buf);
 
     osd_resource_path(buf, "ant%d.bmp", is_fhd, RSSI2Ant(rx_status[0].rx_rssi[0]));
-    lv_img_set_src(g_osd_hdzero.ant1[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.ant1[is_fhd], buf);
 
     osd_resource_path(buf, "ant%d.bmp", is_fhd, RSSI2Ant(rx_status[1].rx_rssi[1]));
-    lv_img_set_src(g_osd_hdzero.ant2[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.ant2[is_fhd], buf);
 
     osd_resource_path(buf, "ant%d.bmp", is_fhd, RSSI2Ant(rx_status[1].rx_rssi[0]));
-    lv_img_set_src(g_osd_hdzero.ant3[is_fhd], buf);
+    lazy_img_set_src(g_osd_hdzero.ant3[is_fhd], buf);
 
     if (showRXOSD && source_is_hdzero && g_setting.osd.element[OSD_GOGGLE_ANT0].show)
-        lv_obj_clear_flag(g_osd_hdzero.ant0[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant0[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.ant0[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant0[is_fhd], true);
 
     if (showRXOSD && source_is_hdzero && g_setting.osd.element[OSD_GOGGLE_ANT1].show)
-        lv_obj_clear_flag(g_osd_hdzero.ant1[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant1[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.ant1[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant1[is_fhd], true);
 
     if (showRXOSD && source_is_hdzero && g_setting.osd.element[OSD_GOGGLE_ANT2].show)
-        lv_obj_clear_flag(g_osd_hdzero.ant2[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant2[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.ant2[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant2[is_fhd], true);
 
     if (showRXOSD && source_is_hdzero && g_setting.osd.element[OSD_GOGGLE_ANT3].show)
-        lv_obj_clear_flag(g_osd_hdzero.ant3[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant3[is_fhd], false);
     else
-        lv_obj_add_flag(g_osd_hdzero.ant3[is_fhd], LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(g_osd_hdzero.ant3[is_fhd], true);
 
     if (g_setting.storage.selftest) {
         snprintf(buf, sizeof(buf), "T:%d-%d", fan_speed.top, g_temperature.top / 10);
-        lv_label_set_text(g_osd_hdzero.osd_tempe[is_fhd][0], buf);
+        lazy_label_set_text(g_osd_hdzero.osd_tempe[is_fhd][0], buf);
 #if defined(HDZGOGGLE) || defined(HDZGOGGLE2)
         snprintf(buf, sizeof(buf), "L:%d-%d", fan_speed.left, g_temperature.left / 10);
-        lv_label_set_text(g_osd_hdzero.osd_tempe[is_fhd][1], buf);
+        lazy_label_set_text(g_osd_hdzero.osd_tempe[is_fhd][1], buf);
 
         snprintf(buf, sizeof(buf), "R:%d-%d", fan_speed.right, g_temperature.right / 10);
-        lv_label_set_text(g_osd_hdzero.osd_tempe[is_fhd][2], buf);
+        lazy_label_set_text(g_osd_hdzero.osd_tempe[is_fhd][2], buf);
 #elif defined(HDZBOXPRO)
 
 #endif
@@ -1037,14 +1150,13 @@ int osd_clear(void) {
     return 0;
 }
 
+// Caller holds lvgl_mutex.
 static int draw_osd_on_screen(uint8_t row, uint8_t col) {
-    pthread_mutex_lock(&lvgl_mutex);
     int index = osd_buf_shadow[row][col];
     if (is_fhd)
         lv_img_set_src(img_arr[is_fhd][row][col], &osd_font_fhd.data[index]);
     else
         lv_img_set_src(img_arr[is_fhd][row][col], &osd_font_hd.data[index]);
-    pthread_mutex_unlock(&lvgl_mutex);
 
     return 0;
 }
@@ -1094,11 +1206,11 @@ static void embedded_osd_init(uint8_t fhd) {
 
     osd_object_create_label(fhd, &g_osd_hdzero.vtx_sent[fhd], "", &g_setting.osd.element[OSD_GOGGLE_CHANNEL].position, so);
     lv_obj_set_style_bg_color(g_osd_hdzero.vtx_sent[fhd], lv_color_hex(0x010101), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(g_osd_hdzero.vtx_sent[fhd], LV_OPA_100, 0);
+    lazy_bg_opa(g_osd_hdzero.vtx_sent[fhd], LV_OPA_100);
     lv_obj_set_style_radius(g_osd_hdzero.vtx_sent[fhd], 50, 0);
-    lv_obj_set_style_text_color(g_osd_hdzero.vtx_sent[fhd], lv_color_make(0x00, 0xFF, 0x00), 0);
+    lazy_text_color(g_osd_hdzero.vtx_sent[fhd], lv_color_make(0x00, 0xFF, 0x00));
     lv_obj_align(g_osd_hdzero.vtx_sent[fhd], LV_ALIGN_TOP_MID, 0, fhd ? 90 : 60);
-    lv_obj_add_flag(g_osd_hdzero.vtx_sent[fhd], LV_OBJ_FLAG_HIDDEN);
+    lazy_hidden(g_osd_hdzero.vtx_sent[fhd], true);
 
     osd_resource_path(buf, "%s", is_fhd, noSdcard_bmp);
     osd_object_create_img(fhd, &g_osd_hdzero.sd_rec[fhd], buf, &g_setting.osd.element[OSD_GOGGLE_SD_REC].position, so);
@@ -1454,9 +1566,20 @@ void load_fc_osd_font(uint8_t fhd) {
     osd_fonts_wait(); // never alongside the boot-time loader (G2)
     fc_variant_apply();
     fc_osd_font_files_load(fhd);
+
+    // The glyph bitmaps were rewritten in place, under images that still
+    // point at them: redraw the cells on screen, or (dirty_render) they would
+    // keep the previous font until each one changes. Callers do not hold
+    // lvgl_mutex (MSP parsing on the DM5680 threads, osd_init).
+    if (g_init_done && scr_osd[fhd]) {
+        pthread_mutex_lock(&lvgl_mutex);
+        lv_obj_invalidate(scr_osd[fhd]);
+        pthread_mutex_unlock(&lvgl_mutex);
+    }
 }
 
 void osd_shadow_clear(void) {
+    pthread_mutex_lock(&lvgl_mutex);
     for (int i = 0; i < HD_VMAX; i++) {
         for (int j = 0; j < HD_HMAX; j++) {
             if (osd_buf_shadow[i][j] != 0x20) {
@@ -1465,6 +1588,7 @@ void osd_shadow_clear(void) {
             }
         }
     }
+    pthread_mutex_unlock(&lvgl_mutex);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1513,6 +1637,7 @@ void osd_inject_mock_fc(void) {
 
 void *thread_osd(void *ptr) {
     static uint8_t fhd_d = 0;
+    perf_thread_name("osd");
     for (;;) {
         // wait for signal to render
         sem_wait(&osd_semaphore);
@@ -1524,7 +1649,9 @@ void *thread_osd(void *ptr) {
             fhd_d = is_fhd;
         }
 
-        // display osd
+        // display osd: one lvgl_mutex hold for the whole pass, not one per
+        // changed cell (a full FC OSD page is hundreds of cells)
+        pthread_mutex_lock(&lvgl_mutex);
         for (int i = 0; i < HD_VMAX; i++) {
             for (int j = 0; j < HD_HMAX; j++) {
                 uint16_t ch = fc_osd[i][j];
@@ -1536,6 +1663,7 @@ void *thread_osd(void *ptr) {
                 }
             }
         }
+        pthread_mutex_unlock(&lvgl_mutex);
     }
     return NULL;
 }

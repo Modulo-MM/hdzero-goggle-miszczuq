@@ -27,12 +27,20 @@ void boot_timing_start(void);
 // the report, so every report says which variant was measured.
 bool boot_opt(const char *name);
 
+// "name=ON name=off ..." for every option queried so far.
+void boot_opt_summary(char *buf, int size);
+
 // Sleep/wake timing, same BOOT_TIMING.log opt-in: go_sleep() calls
 // wake_timing_sleep(), wake_up() calls wake_timing_wake(); a short report is
 // appended once the source shows a valid signal again (or after 30 s).
 void wake_timing_sleep(void);
 void wake_timing_wake(int source, bool fast);
 void wake_timing_mark(const char *tag);
+
+// Same report for a source switch made after boot (SWITCH TIMING REPORT):
+// call at the start of the switch, wake_timing_mark("switch_done") once the
+// new source is set up; it ends at the first valid signal after that.
+void switch_timing_begin(int from, int to);
 
 #ifdef __cplusplus
 }

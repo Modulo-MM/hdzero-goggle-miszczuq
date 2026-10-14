@@ -12,6 +12,7 @@
 #include "core/input_device.h"
 #include "core/msp_displayport.h"
 #include "core/osd.h"
+#include "core/perf_monitor.h"
 #include "core/scan_core.h"
 #include "driver/dm5680.h"
 #include "driver/dm6302.h"
@@ -165,6 +166,7 @@ static void *thread_boot_audio_route(void *arg) {
 
 void app_switch_to_analog(bool is_av_in) {
     boot_mark("switch_to_analog_begin");
+    switch_timing_begin(g_source_info.source, is_av_in ? SOURCE_AV_IN : SOURCE_AV_MODULE);
     dvr_update_vi_conf(VR_720P50);
     osd_fhd(0);
     osd_show(true);
@@ -174,11 +176,16 @@ void app_switch_to_analog(bool is_av_in) {
     Display_Osd(g_setting.record.osd);
 
     Source_AV(is_av_in);
+    // The HDZero receivers ran until Source_AV() closed them: clear what FC
+    // OSD arrived meanwhile (later packets are ignored, see dm5680.c).
+    osd_clear();
+    wake_timing_mark("av_display_set");
     image_settings_apply(SETTING_IMAGE_SOURCE_ANALOG);
     boot_mark("av_image_settings");
 
     analog_receiver_on(is_av_in);
     boot_mark("av_rtc6715");
+    wake_timing_mark("av_receiver_on");
 
     g_setting.autoscan.last_source = is_av_in ? SETTING_AUTOSCAN_SOURCE_AV_IN : SETTING_AUTOSCAN_SOURCE_AV_MODULE;
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2)
@@ -208,21 +215,25 @@ void app_switch_to_analog(bool is_av_in) {
     {
         dvr_select_audio_source(g_setting.record.audio_source);
         dvr_enable_line_out(true);
+        wake_timing_mark("av_audio_routed");
     }
 
     boot_mark("switch_to_analog_before_sleep");
 #ifdef HDZGOGGLE2
     // Not during the initial bring-up: nothing at boot needs this second
-    // (hardware-tested); source switches later keep it.
-    if (g_init_done)
+    // (hardware-tested); source switches later keep it unless fast_switch
+    // (perf_opt) is on, which tests dropping it there too.
+    if (g_init_done && !perf_opt.fast_switch)
 #endif
         sleep(1);
     system_script(REC_STOP_LIVE);
     boot_mark("switch_to_analog_end");
+    wake_timing_mark("switch_done");
 }
 
 void app_switch_to_hdmi_in() {
     boot_mark("switch_to_hdmi_begin");
+    switch_timing_begin(g_source_info.source, SOURCE_HDMI_IN);
     rtc6715.init(0, 0);
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2)
     scan_core_notify_analog_powered_off();
@@ -254,6 +265,7 @@ void app_switch_to_hdmi_in() {
     ini_putl("autoscan", "last_source", g_setting.autoscan.last_source, SETTING_INI);
 
     system_script(REC_STOP_LIVE);
+    wake_timing_mark("switch_done");
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -264,6 +276,7 @@ void app_switch_to_hdzero(bool is_default) {
     int ch;
 
     boot_mark("switch_to_hdzero_begin");
+    switch_timing_begin(g_source_info.source, SOURCE_HDZERO);
 
     rtc6715.init(0, 0);
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2)
@@ -286,6 +299,7 @@ void app_switch_to_hdzero(bool is_default) {
 
     HDZero_open(hdzero_effective_bw());
     boot_mark("hdzero_open");
+    wake_timing_mark("hdzero_open");
     ch &= 0x7f;
 
     LOGI("switch to bw:%d, band:%d, ch:%d, CAM_MODE=%d 4:3=%d", hdzero_effective_bw(), g_setting.source.hdzero_band, g_setting.scan.channel, CAM_MODE, cam_4_3);
@@ -334,6 +348,7 @@ void app_switch_to_hdzero(bool is_default) {
     LOGI("lvgl_switch_to_720p");
 #endif
 
+    wake_timing_mark("hdzero_display_set");
     image_settings_apply(SETTING_IMAGE_SOURCE_HDZERO);
     osd_clear();
     osd_show(true);
@@ -353,6 +368,7 @@ void app_switch_to_hdzero(bool is_default) {
 
     osd_detecting_show(false); // restore the normal channel tag
     boot_mark("switch_to_hdzero_end");
+    wake_timing_mark("switch_done");
 }
 
 void hdzero_switch_channel(int channel) {

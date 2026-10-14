@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "core/defines.h"
+#include "core/perf_monitor.h"
 #include "gpio.h"
 
 static pthread_t beep_thread_handle;
@@ -25,6 +26,7 @@ void beep_dur(int ms) {
 }
 
 static void *beep_thread(void *arg) {
+    perf_thread_name("beep");
     while (1) {
         pthread_mutex_lock(&beep_mutex);
         pthread_cond_wait(&beep_cond, &beep_mutex);

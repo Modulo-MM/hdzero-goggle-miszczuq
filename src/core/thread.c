@@ -24,6 +24,7 @@
 #include "core/input_device.h"
 #include "core/msp_displayport.h"
 #include "core/osd.h"
+#include "core/perf_monitor.h"
 #include "core/settings.h"
 #include "driver/dm5680.h"
 #include "driver/hardware.h"
@@ -226,13 +227,21 @@ static void check_source_signal(int vtmg_change) {
     }
 }
 
+// The work below ran on every 51st pass of a 2 ms sleep loop: PERF.log
+// measured 9.3 work passes a second on the goggles (the 2 ms sleeps last
+// ~2.1 ms), and the debounce counts and timers here are tuned to that pace.
+// One sleep per pass keeps it without the ~500 wakeups a second.
+#define PERIPHERAL_SLEEP_US 106000 // + the pass itself ~= 107.5 ms
+
 static void *thread_peripheral(void *ptr) {
     int record_vtmg_change = 0;
-    int j = 0, k = 0;
+    int k = 0;
 
+    perf_thread_name("periph");
     for (;;) {
-        if (j > 50) {
-            j = 0;
+        usleep(PERIPHERAL_SLEEP_US);
+        {
+            perf_note_periph_pass();
 
             fans_auto_ctrl();
             detect_sdcard();
@@ -294,8 +303,6 @@ static void *thread_peripheral(void *ptr) {
             scan_core_idle_tick();
 #endif
         }
-        j++;
-        usleep(2000);
     }
     return NULL;
 }

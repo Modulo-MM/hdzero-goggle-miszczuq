@@ -2,11 +2,15 @@
 
 #include <stdio.h>
 
+#include <string.h>
+#include <time.h>
+
 #include <log/log.h>
 
 #include "../core/common.hh"
 #include "../core/settings.h"
 #include "core/boot_timing.h"
+#include "core/perf_monitor.h"
 #ifndef EMULATOR_BUILD
 #include "fbtools.h" // Linux framebuffer — goggle display path only (emulator uses SDL)
 #endif
@@ -81,6 +85,109 @@ static orbit_state_t disp_orbit_state = ORBIT_NONE;
 static int disp_orbit_x, disp_orbit_y;
 static lv_disp_t *disp;
 
+static bool orbit_step(void);
+
+static void hdz_disp_monitor(lv_disp_drv_t *drv, uint32_t time_ms, uint32_t px) {
+    perf_note_refresh(time_ms, px);
+}
+
+#ifndef EMULATOR_BUILD
+static uint32_t elapsed_us(const struct timespec *t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec - t0->tv_sec) * 1000000 + (t1.tv_nsec - t0->tv_nsec) / 1000;
+}
+
+// dirty_render (perf_opt): LVGL runs in direct mode -- disp_buf always holds
+// the whole current frame and a refresh redraws only the invalidated areas
+// in it -- and only those areas are copied to the framebuffer, instead of
+// redrawing and copying the whole 1928x1088 screen on every change.
+//
+// The copy uses the full-refresh copy's mapping: LVGL pixel (x, y) goes to
+// linear framebuffer index (y + orbit_y) * W + orbit_x + x, where
+// W = hor_res - DISP_OVERSCAN, for x < W and y + orbit_y < ver_res.
+static uint8_t *dirty_lo, *dirty_hi; // span written by this refresh
+static uint32_t dirty_bytes;
+
+static void fb_copy_rect(const lv_color_t *frame, lv_coord_t x1, lv_coord_t y1, lv_coord_t x2, lv_coord_t y2) {
+    const int hor = disp_drv.hor_res;
+    const int w = hor - DISP_OVERSCAN;
+
+    if (x1 < 0)
+        x1 = 0;
+    if (y1 < 0)
+        y1 = 0;
+    if (x2 > w - 1)
+        x2 = w - 1;
+    if (y2 > disp_drv.ver_res - 1 - disp_orbit_y)
+        y2 = disp_drv.ver_res - 1 - disp_orbit_y;
+    if (x1 > x2 || y1 > y2)
+        return;
+
+    uint8_t *fb = fbdev.fb_mem;
+    size_t len = (size_t)(x2 - x1 + 1) * 4;
+    for (lv_coord_t y = y1; y <= y2; y++) {
+        uint8_t *dst = fb + ((size_t)(y + disp_orbit_y) * w + disp_orbit_x + x1) * 4;
+        memcpy(dst, frame + (size_t)y * hor + x1, len);
+    }
+
+    uint8_t *lo = fb + ((size_t)(y1 + disp_orbit_y) * w + disp_orbit_x + x1) * 4;
+    uint8_t *hi = fb + ((size_t)(y2 + disp_orbit_y) * w + disp_orbit_x + x2 + 1) * 4;
+    if (!dirty_lo || lo < dirty_lo)
+        dirty_lo = lo;
+    if (hi > dirty_hi)
+        dirty_hi = hi;
+    dirty_bytes += len * (y2 - y1 + 1);
+}
+
+static void hdz_disp_flush_dirty(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
+    static int orbit_refresh = 0;
+    static bool first_flush_marked = false;
+
+    // In direct mode LVGL calls this once per redrawn area, with `area` the
+    // whole screen; copy everything at the last call of the refresh.
+    if (!lv_disp_flush_is_last(drv)) {
+        lv_disp_flush_ready(drv);
+        return;
+    }
+
+    if (!first_flush_marked) {
+        first_flush_marked = true;
+        boot_mark("first_fb_flush");
+    }
+
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    dirty_lo = dirty_hi = NULL;
+    dirty_bytes = 0;
+
+    // Same orbit pace as the full-refresh path (lvgl_orbit_tick() with
+    // lazy_ui). A step moves the whole picture, so it copies the whole frame.
+    if (!perf_opt.lazy_ui && ++orbit_refresh % 500 == 0)
+        disp_orbit_state |= ORBIT_FLUSH;
+    bool moved = orbit_step();
+
+    if (moved) {
+        fb_copy_rect(color_p, 0, 0, drv->hor_res - 1, drv->ver_res - 1);
+    } else {
+        // The areas of this refresh: still in the display's list until the
+        // refresh returns (lv_refr.c clears it after the last flush).
+        for (uint16_t i = 0; i < disp->inv_p; i++) {
+            if (disp->inv_area_joined[i])
+                continue;
+            const lv_area_t *a = &disp->inv_areas[i];
+            fb_copy_rect(color_p, a->x1, a->y1, a->x2, a->y2);
+        }
+    }
+
+    if (dirty_lo)
+        fb_sync_range(&fbdev, dirty_lo, dirty_hi);
+    perf_note_flush(dirty_bytes, elapsed_us(&t0));
+
+    lv_disp_flush_ready(drv);
+}
+#endif
+
 static void hdz_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
     static int orbit_flush = 0;
     static bool first_flush_marked = false;
@@ -91,19 +198,26 @@ static void hdz_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_
     }
 
     // Manipulates the orbiting speed
-    if (++orbit_flush % 500 == 0) {
+    if (perf_opt.lazy_ui)
+        orbit_step(); // a step lvgl_orbit_tick() asked for, shown by this copy
+    else if (++orbit_flush % 500 == 0) {
         disp_orbit_state |= ORBIT_FLUSH;
     }
 
 #ifndef EMULATOR_BUILD
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint32_t bytes = 0;
     for (lv_coord_t y = area->y1 + disp_orbit_y; y <= area->y2; y++) {
         fbdev.fb_mem_offset = (y * (disp_drv.hor_res - DISP_OVERSCAN) + disp_orbit_x) * 4;
         fbdev.fb_fix.smem_len = 4 * (area->x2 - area->x1 + 1 - DISP_OVERSCAN);
         memcpy(fbdev.fb_mem + fbdev.fb_mem_offset, ((char *)color_p), fbdev.fb_fix.smem_len);
         color_p += (area->x2 - area->x1 + 1);
+        bytes += fbdev.fb_fix.smem_len;
     }
 
     fb_sync(&fbdev);
+    perf_note_flush(bytes, elapsed_us(&t0));
 #else
     SDL_LockMutex(global_sdl_mutex);
     SDL_Rect
@@ -190,6 +304,16 @@ static void hdz_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_
     SDL_UnlockMutex(global_sdl_mutex);
 #endif
 
+    orbit_step();
+
+    lv_disp_flush_ready(disp);
+}
+
+// Burn-in protection: once ORBIT_FLUSH is set, move the picture one pixel
+// along its orbit. Returns true if the offset changed.
+static bool orbit_step(void) {
+    int old_x = disp_orbit_x, old_y = disp_orbit_y;
+
     if (disp_orbit_state & ORBIT_FLUSH) {
         disp_orbit_state &= ~ORBIT_FLUSH;
 
@@ -222,7 +346,30 @@ static void hdz_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_
         }
     }
 
-    lv_disp_flush_ready(disp);
+    return disp_orbit_x != old_x || disp_orbit_y != old_y;
+}
+
+// lazy_ui (perf_opt): the screen is redrawn only when something on it
+// changes, so one orbit step per 500 refreshes would all but stop the orbit.
+// Step on time instead: 500 refreshes took ~37.5 s when every main-loop pass
+// redrew the screen, a pass being ~75 ms (the sleep reminder's 4000 passes
+// were "about five minutes").
+#define ORBIT_STEP_MS 37500
+
+void lvgl_orbit_tick(void) {
+    static uint32_t last_step = 0;
+
+    if (!perf_opt.lazy_ui || disp_orbit_state == ORBIT_NONE)
+        return;
+    if (lv_tick_elaps(last_step) < ORBIT_STEP_MS)
+        return;
+    last_step = lv_tick_get();
+
+    disp_orbit_state |= ORBIT_FLUSH;
+    // Any refresh applies the step: ask for one with the smallest area
+    // (dirty_render then copies the moved frame without redrawing it).
+    lv_area_t a = {0, 0, 0, 0};
+    lv_obj_invalidate_area(lv_scr_act(), &a);
 }
 
 int lvgl_init_porting() {
@@ -318,6 +465,14 @@ int lvgl_init_porting() {
 
     disp_drv.full_refresh = 1;
     disp_drv.flush_cb = hdz_disp_flush;
+#ifndef EMULATOR_BUILD
+    if (perf_opt.dirty_render) {
+        disp_drv.full_refresh = 0;
+        disp_drv.direct_mode = 1;
+        disp_drv.flush_cb = hdz_disp_flush_dirty;
+    }
+#endif
+    disp_drv.monitor_cb = hdz_disp_monitor;
     disp_drv.draw_buf = &draw_buf;
     disp_drv.hor_res = DRAW_HOR_RES_FHD;
     disp_drv.ver_res = DRAW_VER_RES_FHD;

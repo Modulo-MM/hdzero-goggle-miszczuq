@@ -22,6 +22,7 @@
 #include <log/log.h>
 
 #include "core/common.hh"
+#include "core/perf_monitor.h"
 #include "driver/gpio.h"
 #include "uart.h"
 #include "ui/page_common.h"
@@ -37,7 +38,9 @@ static void *pthread_recv_esp32(void *arg) {
     int i, len = 0;
     uint8_t buffer[128];
     fd_set rd;
-    struct timeval tv = {0, 100000};
+    struct timeval tv;
+
+    perf_thread_name("esp32");
 
     // Init UART buffers
     uart3_rptr = 0;
@@ -53,6 +56,12 @@ static void *pthread_recv_esp32(void *arg) {
             LOGI("UART3:stopping, exiting thread.");
             return NULL;
         }
+        // Re-armed on every pass: Linux select() leaves the unslept time in
+        // tv, so a timeout set once ran out after the first 100 ms and this
+        // loop then spun without sleeping, a whole CPU core for as long as
+        // the backpack was on (PERF.log: the esp32 thread at ~100%).
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
         if (select(fd_esp32 + 1, &rd, NULL, NULL, &tv) < 0) {
             LOGE("UART3:select error!");
             return NULL;
@@ -72,8 +81,10 @@ static void *pthread_recv_esp32(void *arg) {
             }
             if (len)
                 esp32_rx();
-        } else
-            esp32_handler_timeout();
+        }
+        // Its pending-record check runs at most 100 ms apart either way,
+        // also while the backpack is sending.
+        esp32_handler_timeout();
     }
     return NULL;
 }

@@ -20,6 +20,7 @@
 #include "../ui/page_common.h"
 #include "beep.h"
 #include "defines.h"
+#include "devmem.h"
 #include "dm5680.h"
 #include "dm6302.h"
 #include "dvr.h"
@@ -448,14 +449,12 @@ DCLK_DLY_NUM[5:0]
 void vdpo_sync_ctrl_set(bool dclk_invert, bool dclk_dly_en, uint8_t dvlk_dly_num) {
     const uint32_t addr = 0x06542008;
     uint32_t dat = 0x00000003;
-    char buf[32];
 
     dat |= (dclk_invert << 3);
     dat |= (dvlk_dly_num << 4);
     dat |= (dclk_dly_en << 10);
 
-    snprintf(buf, sizeof(buf), "aww 0x%08x 0x%08x", addr, dat);
-    system_exec(buf);
+    reg_write32(addr, dat);
 }
 
 /*
@@ -467,19 +466,15 @@ default value : 9
 void csic_pclk_dly_set(uint8_t pclk_dly_num) {
     const uint32_t addr = 0x06601500;
     uint32_t dat = pclk_dly_num;
-    char buf[32];
 
-    snprintf(buf, sizeof(buf), "aww 0x%08x 0x%08x", addr, dat);
-    system_exec(buf);
+    reg_write32(addr, dat);
 }
 
 void csic_pclk_invert_set(uint8_t is_invert) {
     const uint32_t addr = 0x06601004;
     uint32_t dat = is_invert ? 0x010000A0 : 0x010100A0;
-    char buf[32];
 
-    snprintf(buf, sizeof(buf), "aww 0x%08x 0x%08x", addr, dat);
-    system_exec(buf);
+    reg_write32(addr, dat);
 }
 
 void pclk_phase_set(video_source_t source) {
@@ -532,13 +527,18 @@ void hw_stat_init() {
     pthread_mutex_init(&hardware_mutex, NULL);
 }
 
+static void hdzero_open_early_wait(void);
+static bool hdzero_open_early_defer_m0_close(void);
+
 void Display_VO_SWITCH(uint8_t sel) // 0 = UI;  1 = HDZERO or AV_in or HDMI_in
 {
     I2C_Write(ADDR_FPGA, 0x20, sel);
 
+    if (sel)
+        hdzero_open_early_wait(); // the receivers are up before M0 is touched
     if (sel && g_hw_stat.hdzero_open && (g_hw_stat.source_mode == SOURCE_MODE_HDZERO))
         DM6302_openM0(1);
-    else
+    else if (sel || !hdzero_open_early_defer_m0_close())
         DM6302_openM0(0);
 
     I2C_Write(ADDR_FPGA, 0x06, 0x0F);
@@ -592,7 +592,7 @@ void Display_UI_init() {
     } else {
         g_hw_stat.vdpo_tmg = boot_vdpo_tmg();
     }
-    system_exec("aww 0x0300b340 0x00000008");
+    reg_write32(0x0300b340, 0x00000008);
     Display_VO_SWITCH(0);
 
     vclk_phase_set(VIDEO_SOURCE_MENU_UI, 0);
@@ -601,9 +601,9 @@ void Display_UI_init() {
     I2C_Write(ADDR_FPGA, 0x84, 0x11);
 
     screen.vtmg(0);
-    system_exec("aww 0x0300b084 0x00003fff"); // Set vdpo clock driver strength to level 2. Refer datasheet 12.7.5.11
+    reg_write32(0x0300b084, 0x00003fff); // Set vdpo clock driver strength to level 2. Refer datasheet 12.7.5.11
     I2C_Write(ADDR_FPGA, 0xa7, 0x00);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
 }
 
 void Display_UI() {
@@ -650,7 +650,7 @@ void Display_720P60_50_t(int mode, uint8_t is_43) // fps: 0=50, 1=60
     g_hw_stat.source_mode = SOURCE_MODE_HDZERO;
     Display_VO_SWITCH(1);
     screen.display(1);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
 }
 
 void Display_720P90_t(int mode) {
@@ -672,7 +672,7 @@ void Display_720P90_t(int mode) {
     g_hw_stat.source_mode = SOURCE_MODE_HDZERO;
     Display_VO_SWITCH(1);
     screen.display(1);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
 }
 
 void Display_1080P30_t(int mode) {
@@ -695,7 +695,7 @@ void Display_1080P30_t(int mode) {
     g_hw_stat.source_mode = SOURCE_MODE_HDZERO;
     Display_VO_SWITCH(1);
     screen.display(1);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
 }
 
 void Display_1080P24_t(int mode) {
@@ -719,7 +719,7 @@ void Display_1080P24_t(int mode) {
     g_hw_stat.source_mode = SOURCE_MODE_HDZERO;
     Display_VO_SWITCH(1);
     screen.display(1);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
 }
 
 void Display_720P60_50(int mode, uint8_t is_43) {
@@ -746,9 +746,18 @@ void Display_1080P30(int mode) {
     pthread_mutex_unlock(&hardware_mutex);
 }
 
-void HDZero_open(int bw) {
+static void hdzero_close_now(void) {
+    DM5680_SetBB(0);
+    DM5680_ResetRF(0);
+    g_hw_stat.hdzero_open = 0;
+    g_hw_stat.m0_open = 0;
+
+    LOGI("HDZero: close");
+}
+
+static void hdzero_open_now(int bw) {
     if (bw != g_hw_stat.hdz_bw) // reopen with different bw
-        HDZero_Close();
+        hdzero_close_now();
 
     if (g_hw_stat.hdzero_open == 0) {
         g_hw_stat.hdz_bw = bw;
@@ -760,13 +769,71 @@ void HDZero_open(int bw) {
     }
 }
 
-void HDZero_Close() {
-    DM5680_SetBB(0);
-    DM5680_ResetRF(0);
-    g_hw_stat.hdzero_open = 0;
-    g_hw_stat.m0_open = 0;
+// Boot (G2): open the HDZero receivers on a worker while the UI is built
+// (bootopt/disable_hdzero_early_rf restores the old order). DM6302_init
+// (~2 s) programs the RF chips through the FPGA's SPI bridge, 7 I2C
+// transfers per register plus fixed delays, while building the UI is CPU
+// work, so the two overlap well. Every path that touches the receivers
+// waits for the worker first (HDZero_open, HDZero_Close,
+// Display_VO_SWITCH(1)). The one boot-time exception is the M0 close of
+// Display_UI_init's Display_VO_SWITCH(0): it is deferred until the worker
+// is done -- the same close-then-reopen a menu round trip does -- so that
+// no two threads ever drive the SPI bridge at once.
+static pthread_mutex_t hdz_early_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t hdz_early_tid;
+static bool hdz_early_running = false;
+static bool hdz_early_m0_close = false;
 
-    LOGI("HDZero: close");
+static void *hdzero_open_early_thread(void *arg) {
+    // Thousands of transfers: let the main thread's own I2C work go first.
+    i2c_set_background(true);
+    hdzero_open_now((int)(intptr_t)arg);
+    boot_mark("hdz_early_done");
+    return NULL;
+}
+
+void HDZero_open_early(int bw) {
+    pthread_mutex_lock(&hdz_early_mutex);
+    if (!hdz_early_running && !g_hw_stat.hdzero_open) {
+        hdz_early_running = pthread_create(&hdz_early_tid, NULL, hdzero_open_early_thread,
+                                           (void *)(intptr_t)bw) == 0;
+        if (hdz_early_running)
+            boot_mark("hdz_early_start");
+    }
+    pthread_mutex_unlock(&hdz_early_mutex);
+}
+
+static void hdzero_open_early_wait(void) {
+    pthread_mutex_lock(&hdz_early_mutex);
+    if (hdz_early_running) {
+        pthread_join(hdz_early_tid, NULL);
+        hdz_early_running = false;
+        boot_mark("hdz_early_joined");
+        if (hdz_early_m0_close) {
+            hdz_early_m0_close = false;
+            DM6302_openM0(0);
+        }
+    }
+    pthread_mutex_unlock(&hdz_early_mutex);
+}
+
+static bool hdzero_open_early_defer_m0_close(void) {
+    pthread_mutex_lock(&hdz_early_mutex);
+    bool deferred = hdz_early_running;
+    if (deferred)
+        hdz_early_m0_close = true;
+    pthread_mutex_unlock(&hdz_early_mutex);
+    return deferred;
+}
+
+void HDZero_open(int bw) {
+    hdzero_open_early_wait();
+    hdzero_open_now(bw);
+}
+
+void HDZero_Close() {
+    hdzero_open_early_wait();
+    hdzero_close_now();
 }
 
 // The HDZero camera mode last applied to the display. Restored at boot from
@@ -900,7 +967,7 @@ void AV_Mode_Switch_fpga(int is_pal) {
         I2C_Write(ADDR_FPGA, 0x80, 0x00);
     }
     I2C_Write(ADDR_FPGA, 0x06, 0x0F);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
 }
 
 void AV_Mode_Switch(int is_pal) {

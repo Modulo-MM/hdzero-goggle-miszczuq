@@ -86,6 +86,11 @@ void hw_screen_on(int bON);
 void HDZero_open(int bw);
 void HDZero_restore_cam_mode(void); // G2: see hardware-goggle2.c
 void HDZero_Close();
+#ifdef HDZGOGGLE2
+// Start HDZero_open(bw) on a worker at boot; the next HDZero_open/
+// HDZero_Close waits for it.
+void HDZero_open_early(int bw);
+#endif
 
 void Source_HDMI_in();
 void Source_AV(bool is_av_in);

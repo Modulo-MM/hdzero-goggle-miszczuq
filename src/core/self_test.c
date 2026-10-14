@@ -9,6 +9,7 @@
 
 #include "core/common.hh"
 #include "core/settings.h"
+#include "driver/devmem.h"
 #include "driver/dm5680.h"
 #include "driver/dm6302.h"
 #include "driver/hardware.h"
@@ -30,7 +31,7 @@ void self_test() {
     // rc.sh already set vdpo to 1080p50 and nothing has changed it since.
     // Repeating "dispw -s vdpo 1080p50" here cost ~1.1 s per boot (every vdpo
     // mode set does), so only the register write is kept (hardware-tested).
-    system_exec("aww 0x0300b340 0x00000008");
+    reg_write32(0x0300b340, 0x00000008);
 #endif
 
     if (!g_setting.storage.selftest)

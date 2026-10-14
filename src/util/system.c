@@ -4,9 +4,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
+#include "core/perf_monitor.h"
 #include "log/log.h"
 #include "util/filesystem.h"
+
+#ifndef EMULATOR_BUILD
+// system() plus its duration, for PERF.log and the app log: every call is a
+// shell (and usually another process) started from scratch.
+static int timed_system(const char *command) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int ret = system(command);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint32_t us = (t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000;
+    perf_note_shell(us);
+    LOGI("  took %u ms", us / 1000);
+    return ret;
+}
+#endif
 
 int system_exec(const char *command) {
     LOGI("System Execute: %s", command);
@@ -21,7 +38,7 @@ int system_exec(const char *command) {
     LOGI("  [emulator] not executed (host-safe no-op)");
     return 0;
 #else
-    return system(command);
+    return timed_system(command);
 #endif
 }
 
@@ -41,7 +58,7 @@ int system_script(const char *command) {
              sizeof(buffer), "%s > /tmp/%s.log 2>&1",
              command,
              script);
-    int retval = system(buffer);
+    int retval = timed_system(buffer);
 
     // Read contents of temporary file and use logging framework
     snprintf(buffer, sizeof(buffer), "/tmp/%s.log", script);

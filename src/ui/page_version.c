@@ -18,6 +18,7 @@
 #include "core/elrs.h"
 #include "core/esp32_flash.h"
 #include "core/osd.h"
+#include "core/perf_monitor.h"
 #include "driver/beep.h"
 #include "driver/dm5680.h"
 #include "driver/esp32.h"
@@ -1275,6 +1276,7 @@ void *thread_version(void *ptr) {
     int step2_start_sec = 0;
 
     int percentage = 0;
+    perf_thread_name("version");
     for (;;) {
         if (is_need_update_progress) {
             get_progress_info(&v0, &v1, &v2);

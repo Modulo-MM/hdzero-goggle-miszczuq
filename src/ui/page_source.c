@@ -27,6 +27,7 @@
 #include "ui/page_scannow.h"
 #include "ui/ui_main_menu.h"
 #include "ui/ui_porting.h"
+#include "ui/ui_lazy.h"
 #include "ui/ui_statusbar.h"
 #include "ui/ui_style.h"
 #include <log/log.h>
@@ -242,7 +243,7 @@ void source_status_timer() {
         }
         snprintf(buf, sizeof(buf), "HDZero: L%d", ch);
     }
-    lv_label_set_text(label[0], buf);
+    lazy_label_set_text(label[0], buf);
 
 #if defined(HDZGOGGLE)
     snprintf(buf, sizeof(buf), "%s: %s", _lang("Analog"), state2string(g_source_info.av_bay_status));
@@ -255,7 +256,7 @@ void source_status_timer() {
         snprintf(buf, sizeof(buf), "%s: %s", _lang("Analog"), _lang("Expansion Module"));
     }
 #endif
-    lv_label_set_text(label[1], buf);
+    lazy_label_set_text(label[1], buf);
 
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2)
     // Auto Detect row mirrors the HDZero/Analog rows: show the current channel
@@ -268,22 +269,22 @@ void source_status_timer() {
                               : (g_setting.scan.channel & 0x7F);
         snprintf(buf, sizeof(buf), "%s: %s", _lang("Auto"),
                  channel2str_tagged(proto, adch));
-        lv_label_set_text(auto_detect_label, buf);
+        lazy_label_set_text(auto_detect_label, buf);
     }
 #endif
 
     snprintf(buf, sizeof(buf), "HDMI %s: %s", _lang("In"), state2string(g_source_info.hdmi_in_status));
-    lv_label_set_text(label[2], buf);
+    lazy_label_set_text(label[2], buf);
 
     snprintf(buf, sizeof(buf), "AV %s: %s", _lang("In"), state2string(g_source_info.av_in_status));
-    lv_label_set_text(label[3], buf);
+    lazy_label_set_text(label[3], buf);
 
     if (g_setting.storage.selftest && label[3]) {
         uint8_t oled_tm = oled_tst_mode & 0x0F;
         char *pattern_label[6] = {"Normal", "Color Bar", "Grid", "All Black", "All White", "Boot logo"};
         char str[32];
         snprintf(str, sizeof(str), "Display Pattern: %s", pattern_label[oled_tm]);
-        lv_label_set_text(label[4], str);
+        lazy_label_set_text(label[4], str);
     }
 }
 

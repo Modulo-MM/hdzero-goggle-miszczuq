@@ -29,6 +29,7 @@ int fb_close(PFBDEV pFbdev);
 int get_display_depth(PFBDEV pFbdev);
 void fb_memset(void *addr, int c, size_t len);
 void fb_sync(PFBDEV pFbdev);
+void fb_sync_range(PFBDEV pFbdev, void *begin, void *end);
 
 #ifdef __cplusplus
 }

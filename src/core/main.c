@@ -27,6 +27,7 @@ SDL_mutex *global_sdl_mutex;
 #include "core/ht.h"
 #include "core/input_device.h"
 #include "core/osd.h"
+#include "core/perf_monitor.h"
 #include "core/scan_core.h"
 #include "core/self_test.h"
 #include "core/settings.h"
@@ -225,8 +226,14 @@ void start_running(void) {
 // before ht_enable()/ht_disable().
 static pthread_t bmi270_tid;
 static bool bmi270_async = false;
+// With the early HDZero bring-up the BMI270 waits until HDZero video is up:
+// its ~0.7 s of config upload shares the one I2C bus with the receivers'.
+static bool bmi270_deferred = false;
+static bool hdz_early_rf = false;
 
 static void *thread_bmi270_init(void *arg) {
+    if (arg)
+        i2c_set_background(true); // deferred: never in the way of the UI's I2C
     enable_bmi270();
     boot_mark("enable_bmi270");
     return NULL;
@@ -242,6 +249,16 @@ static bool boot_enters_builtin_analog(void) {
            g_setting.source.analog_module == SETTING_SOURCES_ANALOG_MODULE_INTERNAL;
 }
 static bool analog_rx_early = false;
+
+// Does this boot go straight into HDZero video? Same decision as
+// start_running()'s HDZero branch.
+static bool boot_enters_hdzero(void) {
+    int source = g_setting.autoscan.source == SETTING_AUTOSCAN_SOURCE_LAST ? g_setting.autoscan.last_source
+                                                                          : g_setting.autoscan.source;
+    return source == SETTING_AUTOSCAN_SOURCE_HDZERO &&
+           (g_setting.autoscan.status == SETTING_AUTOSCAN_STATUS_LAST ||
+            (g_setting.autoscan.status == SETTING_AUTOSCAN_STATUS_ON && g_setting.autoscan.load_from_boot));
+}
 
 // rc.sh sets the vdpo mode in the background on the G2 (~1.5 s in the
 // driver) and removes this file when done. Wait for it before touching the
@@ -265,8 +282,11 @@ static void device_init(void) {
     self_test();
     boot_mark("self_test");
 #ifdef HDZGOGGLE2
-    bmi270_async = pthread_create(&bmi270_tid, NULL, thread_bmi270_init, NULL) == 0;
-    if (!bmi270_async) {
+    if (hdz_early_rf)
+        bmi270_deferred = true; // started after start_running(), see main()
+    else
+        bmi270_async = pthread_create(&bmi270_tid, NULL, thread_bmi270_init, NULL) == 0;
+    if (!bmi270_async && !bmi270_deferred) {
         enable_bmi270();
         boot_mark("enable_bmi270");
     }
@@ -315,6 +335,7 @@ int main(int argc, char *argv[]) {
     // 1. Recall configuration
     settings_init();
     settings_load();
+    perf_opts_init();
 #ifdef HDZGOGGLE2
     HDZero_restore_cam_mode(); // the last HDZero camera mode, for the first Display_* call
 #endif
@@ -356,12 +377,27 @@ int main(int argc, char *argv[]) {
     boot_mark("input_device_init");
     hw_stat_init();
     boot_mark("hw_stat_init");
+#ifdef HDZGOGGLE2
+    // Early HDZero receiver bring-up (see HDZero_open_early);
+    // bootopt/disable_hdzero_early_rf turns it off for a boot.
+    hdz_early_rf = boot_enters_hdzero() && !boot_opt("disable_hdzero_early_rf");
+#endif
     device_init();
 #ifdef HDZGOGGLE2
     if (boot_enters_builtin_analog() && boot_opt("analog_early_rx")) {
         rtc6715_power_on_early();
         analog_rx_early = true;
         boot_mark("analog_rx_power_on");
+    }
+    // Bring the HDZero receivers up (~2 s, mostly I2C to the FPGA's SPI
+    // bridge) on a worker while the UI is built; app_switch_to_hdzero()'s
+    // HDZero_open() waits for it. The DM5680 UART commands of device_init()
+    // are done by now. The analog receiver goes off first, as
+    // app_switch_to_hdzero() does before opening.
+    if (hdz_early_rf) {
+        rtc6715.init(0, 0);
+        scan_core_notify_analog_powered_off();
+        HDZero_open_early(hdzero_effective_bw());
     }
 #endif
     esp32_init();
@@ -425,6 +461,18 @@ int main(int argc, char *argv[]) {
     boot_mark("start_running_begin");
     start_running();
     boot_mark("start_running_end");
+#ifdef HDZGOGGLE2
+    // The IMU is read only once bmi270_ready() (the IMU timer checks), and
+    // ht_enable()/ht_disable() above do not touch the chip.
+    if (bmi270_deferred) {
+        if (pthread_create(&bmi270_tid, NULL, thread_bmi270_init, (void *)1) == 0) {
+            pthread_detach(bmi270_tid);
+        } else {
+            enable_bmi270();
+            boot_mark("enable_bmi270");
+        }
+    }
+#endif
     create_threads();
     boot_mark("create_threads");
 
@@ -444,6 +492,7 @@ int main(int argc, char *argv[]) {
     // so they don't compete with the bring-up.
     close(open("/tmp/app_init_done", O_WRONLY | O_CREAT, 0644));
     boot_timing_start();
+    perf_monitor_start();
     bool first_loop_done = false;
 
 #ifdef EMULATOR_BUILD
@@ -462,12 +511,17 @@ int main(int argc, char *argv[]) {
     bool elrs_backpack_started = false;
 
     for (;;) {
+        uint32_t t = perf_loop_now(); // PERF.log main-loop breakdown
         pthread_mutex_lock(&lvgl_mutex);
+        t = perf_loop_section(PERF_LOOP_OTHER, t);
         main_menu_update();
+        t = perf_loop_section(PERF_LOOP_MENU, t);
         rtc_persist_tick();
         sleep_reminder();
         statubar_update();
+        t = perf_loop_section(PERF_LOOP_STATUSBAR, t);
         osd_hdzero_update();
+        t = perf_loop_section(PERF_LOOP_OSD, t);
 #ifdef EMULATOR_BUILD
         if (gif_cnt % 200 == 0)
             osd_inject_mock_fc();
@@ -475,9 +529,14 @@ int main(int argc, char *argv[]) {
         ims_update();
         ui_osd_element_pos_update();
         ht_detect_motion();
+        lvgl_orbit_tick();
+        t = perf_loop_section(PERF_LOOP_OTHER, t);
         lv_timer_handler();
+        t = perf_loop_section(PERF_LOOP_LVGL, t);
         source_status_timer();
         pthread_mutex_unlock(&lvgl_mutex);
+        perf_loop_section(PERF_LOOP_OTHER, t);
+        perf_note_loop_pass();
 
         if (!first_loop_done) {
             first_loop_done = true;

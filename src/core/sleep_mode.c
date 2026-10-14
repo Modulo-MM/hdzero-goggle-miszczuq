@@ -18,7 +18,11 @@ static app_state_t previousState;
 static int fans_auto_mode_save;
 static fan_speed_t fan_speed_save;
 
-static uint16_t beepCnt = 0;
+// Sleep reminder beep: every SLEEP_REMINDER_MS. It was 4000 main-loop passes,
+// "about five minutes" when a pass redrew the whole screen; a pass is far
+// shorter now, so count wall-clock time instead.
+#define SLEEP_REMINDER_MS (5 * 60 * 1000)
+static uint32_t sleep_reminder_last = 0;
 
 bool isSleeping = false;
 
@@ -60,7 +64,7 @@ void go_sleep() {
     fans_left_setspeed(MIN_FAN_SIDE);
     fans_right_setspeed(MIN_FAN_SIDE);
     isSleeping = true;
-    beepCnt = 0;
+    sleep_reminder_last = lv_tick_get();
 }
 
 void wake_up() {
@@ -117,9 +121,8 @@ void sleep_reminder() {
         return;
     }
 
-#define BEEP_INTERVAL 4000
-    if (++beepCnt == BEEP_INTERVAL) {
+    if (lv_tick_elaps(sleep_reminder_last) >= SLEEP_REMINDER_MS) {
         beep_dur(BEEP_VERY_SHORT);
-        beepCnt = 0;
+        sleep_reminder_last = lv_tick_get();
     }
 }

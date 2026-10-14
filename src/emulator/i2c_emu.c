@@ -18,6 +18,10 @@ bool iic_is_port_ready(int port) {
 
 void iic_init(void) {}
 
+void i2c_set_background(bool on) {
+    (void)on;
+}
+
 uint8_t i2c_read(int port, uint8_t slave_address, uint8_t addr) {
     (void)port, (void)slave_address, (void)addr;
     return 0;

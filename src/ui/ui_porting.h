@@ -19,6 +19,7 @@ int lvgl_init_porting();
 int lvgl_switch_to_720p();
 int lvgl_switch_to_1080p();
 void lvgl_screen_orbit(bool enable);
+void lvgl_orbit_tick(void); // main loop, holding lvgl_mutex
 
 #ifdef __cplusplus
 }

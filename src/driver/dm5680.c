@@ -26,6 +26,8 @@
 #include "core/input_device.h"
 #include "core/msp_displayport.h"
 #include "core/osd.h"
+#include "core/perf_monitor.h"
+#include "driver/hardware.h"
 #include "driver/uart.h"
 #include "ui/page_common.h"
 
@@ -114,8 +116,14 @@ void uart_parse(uint8_t sel, uint8_t *state, uint8_t *len, uint8_t *payload, uin
             DM5680_get_vtxinfo(sel, ptr);
             break;
 
-        case 0x15:      // osd_data....... crc
-            if (!sel) { // Update OSD from UART1 only sel: 1=from left, 0= from right
+        case 0x15: // osd_data....... crc
+            // Update OSD from UART1 only sel: 1=from left, 0= from right.
+            // Not while analog or HDMI In is on screen: switching there from
+            // HDZero takes ~1.2 s before the receivers close, and FC OSD
+            // packets arriving meanwhile drew the HDZero OSD over the new
+            // source until the no-data timeout (~15 s) cleared it.
+            if (!sel && g_hw_stat.source_mode != SOURCE_MODE_AV &&
+                g_hw_stat.source_mode != SOURCE_MODE_HDMIIN) {
                 DM5680_OSD_parse(&ptr[2], ptr[0] - 1);
                 g_osd_update_cnt = 0;
             }
@@ -167,6 +175,7 @@ static void *pthread_recv_dm5680l(void *arg) {
     uart_rptr[0] = 0;
     uart_wptr[0] = 0;
     state = len8 = payload_ptr = 0;
+    perf_thread_name("dm5680l");
 
     for (;;) {
         FD_ZERO(&rd);
@@ -205,6 +214,7 @@ static void *pthread_recv_dm5680r(void *arg) {
     uart_rptr[1] = 0;
     uart_wptr[1] = 0;
     state = len8 = payload_ptr = 0;
+    perf_thread_name("dm5680r");
 
     for (;;) {
         FD_ZERO(&rd);

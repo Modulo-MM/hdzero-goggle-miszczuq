@@ -17,6 +17,7 @@
 #include "../ui/page_common.h"
 #include "beep.h"
 #include "defines.h"
+#include "devmem.h"
 #include "dm5680.h"
 #include "dm6302.h"
 #include "driver/screen.h"
@@ -213,14 +214,12 @@ DCLK_DLY_NUM[5:0]
 void vdpo_sync_ctrl_set(bool dclk_invert, bool dclk_dly_en, uint8_t dvlk_dly_num) {
     const uint32_t addr = 0x06542008;
     uint32_t dat = 0x00000003;
-    char buf[32];
 
     dat |= (dclk_invert << 3);
     dat |= (dvlk_dly_num << 4);
     dat |= (dclk_dly_en << 10);
 
-    snprintf(buf, sizeof(buf), "aww 0x%08x 0x%08x", addr, dat);
-    system_exec(buf);
+    reg_write32(addr, dat);
 }
 
 /*
@@ -232,19 +231,15 @@ default value : 9
 void csic_pclk_dly_set(uint8_t pclk_dly_num) {
     const uint32_t addr = 0x06601500;
     uint32_t dat = pclk_dly_num;
-    char buf[32];
 
-    snprintf(buf, sizeof(buf), "aww 0x%08x 0x%08x", addr, dat);
-    system_exec(buf);
+    reg_write32(addr, dat);
 }
 
 void csic_pclk_invert_set(uint8_t is_invert) {
     const uint32_t addr = 0x06601004;
     uint32_t dat = is_invert ? 0x010000A0 : 0x010100A0;
-    char buf[32];
 
-    snprintf(buf, sizeof(buf), "aww 0x%08x 0x%08x", addr, dat);
-    system_exec(buf);
+    reg_write32(addr, dat);
 }
 
 void pclk_phase_set(video_source_t source) {
@@ -538,7 +533,7 @@ void Display_HDZ_t(int mode, int is_43) {
     Display_VO_SWITCH(1);
     screen.display(1);
     I2C_Write(ADDR_FPGA, 0x8C, 0x01);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
 }
 
 void Display_HDZ(int mode, int is_43) {
@@ -597,7 +592,7 @@ void Display_UI_init() {
     pclk_phase_set(VIDEO_SOURCE_MENU_UI);
 
     screen.display(1);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
 }
 
 void Display_UI() {
@@ -659,7 +654,7 @@ bool Display_Playback(int fps) {
     }
 
     screen.display(1);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
     pthread_mutex_unlock(&hardware_mutex);
     return true;
 }
@@ -733,7 +728,7 @@ void AV_Mode_Switch_fpga(int is_pal) {
         I2C_Write(ADDR_FPGA, 0x80, 0x00);
     }
     I2C_Write(ADDR_FPGA, 0x06, 0x0F);
-    system_exec("aww 0x06542018 0x00000044"); // disable horizontal chroma FIR filter.
+    reg_write32(0x06542018, 0x00000044); // disable horizontal chroma FIR filter.
     pclk_phase_set(VIDEO_SOURCE_AV_IN);
 }
 

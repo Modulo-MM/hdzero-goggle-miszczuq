@@ -12,6 +12,8 @@
 #include "core/app_state.h"
 #include "core/common.hh"
 #include "core/dvr.h"
+#include "core/perf_monitor.h"
+#include "driver/mixer.h"
 #include "lang/language.h"
 #include "page_common.h"
 #include "ui/ui_style.h"
@@ -303,6 +305,26 @@ static void page_audio_update_test_indicator(uint32_t delta_ms) {
                 fill_w = AUDIO_TEST_FILL_MAX_W;
             }
         }
+        // This runs on every main-loop pass whatever is on screen, and each
+        // style set invalidates (border width also re-lays out the menu), so
+        // with lazy_ui (perf_opt) the styles are touched only on a change.
+        static struct {
+            bool valid;
+            lv_color_t bg_color, fill_color;
+            lv_coord_t border_w, fill_w;
+            lv_opa_t fill_opa;
+        } shown[AUDIO_TEST_COUNT];
+        if (perf_opt.lazy_ui && shown[i].valid && shown[i].bg_color.full == bg_color.full &&
+            shown[i].border_w == border_w && shown[i].fill_w == fill_w &&
+            shown[i].fill_color.full == fill_color.full && shown[i].fill_opa == fill_opa)
+            continue;
+        shown[i].valid = true;
+        shown[i].bg_color = bg_color;
+        shown[i].border_w = border_w;
+        shown[i].fill_w = fill_w;
+        shown[i].fill_color = fill_color;
+        shown[i].fill_opa = fill_opa;
+
         lv_obj_set_style_text_color(test_label[i], white_color, 0);
         lv_obj_set_style_bg_color(test_btn[i], bg_color, 0);
         lv_obj_set_style_bg_opa(test_btn[i], LV_OPA_100, 0);
@@ -448,10 +470,7 @@ static void page_audio_play_wav(const char *path) {
 }
 
 static void page_audio_enable_dac_playback(void) {
-    char buf[128];
-
-    snprintf(buf, sizeof(buf), "%s out_on", AUDIO_SEL_SH);
-    system_exec(buf);
+    audio_sel("out_on");
 #if defined(HDZGOGGLE)
     // Replicate the Playback menu's codec state exactly -- the only playback
     // route that is clean on the G1. It never enables the Output Mixer DAC
@@ -461,50 +480,42 @@ static void page_audio_enable_dac_playback(void) {
     dvr_mute_live_audio(); // cut LINEIN from the output mixer, like adec2ao
     dvr_set_dvr_audio_volume(g_setting.record.dvr_audio_volume);
 #else
-    snprintf(buf, sizeof(buf), "%s out_linein_off", AUDIO_SEL_SH);
-    system_exec(buf);
+    audio_sel("out_linein_off");
     // Cut the remaining analog inputs to the output mixer too: a MIC boost
     // stage left enabled by the board's boot state feeds open-mic noise to
     // the lineout whenever it is on (nothing in the app ever switches these).
-    snprintf(buf, sizeof(buf), "%s out_mic1_off", AUDIO_SEL_SH);
-    system_exec(buf);
-    snprintf(buf, sizeof(buf), "%s out_mic2_off", AUDIO_SEL_SH);
-    system_exec(buf);
-    snprintf(buf, sizeof(buf), "%s out_dac_on", AUDIO_SEL_SH);
-    system_exec(buf);
+    audio_sel("out_mic1_off");
+    audio_sel("out_mic2_off");
+    audio_sel("out_dac_on");
     // aplay drives AIF1 timeslot 0 only; force the documented clean playback
     // route (record/audio/audiocodec/audio-setup.txt). The MPI AO engine sets
     // its own codec route up (which is why normal DVR playback is clean), but
     // a raw aplay inherits whatever DAC-mixer state the board booted with --
     // an enabled ADC sidetone or an idle timeslot-1 input mixes noise
     // straight into the DAC, heard as static under the test sample.
-    system_exec("amixer cset name='DACL Mixer AIF1DA0L Switch' 1");
-    system_exec("amixer cset name='DACR Mixer AIF1DA0R Switch' 1");
-    system_exec("amixer cset name='DACL Mixer ADCL Switch' 0");
-    system_exec("amixer cset name='DACR Mixer ADCR Switch' 0");
+    mixer_cset("DACL Mixer AIF1DA0L Switch", "1");
+    mixer_cset("DACR Mixer AIF1DA0R Switch", "1");
+    mixer_cset("DACL Mixer ADCL Switch", "0");
+    mixer_cset("DACR Mixer ADCR Switch", "0");
     dvr_set_dvr_audio_volume(g_setting.record.dvr_audio_volume);
     // dvr_set_dvr_audio_volume raises both timeslot volumes; keep the unused
     // timeslot 1 silent while the test plays (the next real playback or test
     // restores it).
-    system_exec("amixer cset name='AIF1 DAC timeslot 1 volume' 0,0");
+    mixer_cset("AIF1 DAC timeslot 1 volume", "0,0");
 #endif
 }
 
 static void page_audio_disable_dac_playback(bool live_audio_was_enabled) {
-    char buf[128];
-
 #if !defined(HDZGOGGLE)
     // G1 never enabled the Output Mixer DAC path (see
     // page_audio_enable_dac_playback), so there is nothing to switch off.
-    snprintf(buf, sizeof(buf), "%s out_dac_off", AUDIO_SEL_SH);
-    system_exec(buf);
+    audio_sel("out_dac_off");
 #endif
 
     if (live_audio_was_enabled) {
         dvr_restore_live_audio();
     } else {
-        snprintf(buf, sizeof(buf), "%s out_off", AUDIO_SEL_SH);
-        system_exec(buf);
+        audio_sel("out_off");
     }
 }
 

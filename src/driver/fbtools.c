@@ -98,6 +98,20 @@ void fb_sync(PFBDEV pFbdev) {
     ioctl(pFbdev->fb, FBIOPAN_DISPLAY, &pFbdev->fb_var);
 }
 
+// fb_sync() for a partial update: the cache sync covers just [begin, end),
+// the bytes written; the pan still commits the whole screen as fb_sync() does.
+void fb_sync_range(PFBDEV pFbdev, void *begin, void *end) {
+    void *args[2] = {begin, end};
+    ioctl(pFbdev->fb, FBIO_CACHE_SYNC, args);
+
+    pFbdev->fb_var.yoffset = 0;
+    pFbdev->fb_var.reserved[0] = 0;
+    pFbdev->fb_var.reserved[1] = 0;
+    pFbdev->fb_var.reserved[2] = pFbdev->fb_var.xres;
+    pFbdev->fb_var.reserved[3] = pFbdev->fb_var.yres;
+    ioctl(pFbdev->fb, FBIOPAN_DISPLAY, &pFbdev->fb_var);
+}
+
 int fb_clean() {
     FBDEV fbdev;
     memset(&fbdev, 0x0, sizeof(FBDEV));

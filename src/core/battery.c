@@ -8,11 +8,16 @@
 sys_battery_t g_battery;
 
 static int battery_detect_type() {
-    int v = read_voltage();
+    int v = g_battery.voltage;
     return (v * 10 / 1000 / 42 + 1);
 }
 
 void battery_init() {
+    // Also the first voltage sample. The peripheral thread's first
+    // battery_update() comes ~0.5 s after init, and until then 0 V read as a
+    // flat battery: the low-voltage warning beeped at every power-on.
+    g_battery.voltage = read_voltage();
+
     switch (g_setting.power.cell_count_mode) {
     default:
     case SETTING_POWER_CELL_COUNT_MODE_AUTO:

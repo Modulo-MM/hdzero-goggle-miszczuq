@@ -1,6 +1,7 @@
 #include "dvr.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdarg.h>
@@ -16,8 +17,10 @@
 #include "../conf/targets.h"
 
 #include "core/msp_displayport.h"
+#include "core/perf_monitor.h"
 #include "core/settings.h"
 #include "driver/hardware.h"
+#include "driver/mixer.h"
 #include "record/record_definitions.h"
 #include "ui/page_common.h"
 #include "util/sdcard.h"
@@ -75,12 +78,103 @@ void dvr_clear_race_label(void) {
 }
 
 ///////////////////////////////////////////////////////////////////
+// record.conf writes
+//
+// record.conf is on the JFFS2 flash and every ini_put*() rewrites the whole
+// file; a recording start used to write ~20 keys and sync(). With dvr_async
+// (perf_opt) a key is written only when its value differs from the file.
+static bool rec_conf_dirty = false;
+
+static void rec_conf_putl(const char *section, const char *key, long value) {
+    if (perf_opt.dvr_async && ini_getl(section, key, LONG_MIN, REC_CONF) == value)
+        return;
+    ini_putl(section, key, value, REC_CONF);
+    rec_conf_dirty = true;
+}
+
+static void rec_conf_puts(const char *section, const char *key, const char *value) {
+    if (perf_opt.dvr_async) {
+        char cur[64];
+        ini_gets(section, key, "\x7f", cur, sizeof(cur), REC_CONF);
+        if (strcmp(cur, value) == 0)
+            return;
+    }
+    ini_puts(section, key, value, REC_CONF);
+    rec_conf_dirty = true;
+}
+
+///////////////////////////////////////////////////////////////////
+// dvr_async (perf_opt): record start/stop on a worker thread
+//
+// A start rewrote record.conf, set the audio route, then slept 2 s for the
+// record process; a stop slept 2 s too. All of it ran on the caller's
+// thread: the input handler holds lvgl_mutex, so the OSD and the buttons
+// froze for 2-3 s on every record press, and a channel change while
+// recording waited out the stop. With dvr_async, dvr_cmd() updates the state
+// at once and queues the command; the worker sends them in order with the
+// same 2 s settle after each, and dvr_update_status() skips its check while
+// the worker is busy (it used to wait on dvr_mutex through the sleep).
+typedef enum {
+    DVR_OP_START,
+    DVR_OP_STOP,
+} dvr_op_t;
+
+#define DVR_QUEUE_LEN 16
+static dvr_op_t dvr_queue[DVR_QUEUE_LEN];
+static int dvr_queue_head = 0;
+static int dvr_queue_count = 0;
+static bool dvr_worker_busy = false; // running a command or its settle time
+static bool dvr_worker_failed = false;
+static pthread_mutex_t dvr_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dvr_queue_cond = PTHREAD_COND_INITIALIZER;
+static pthread_once_t dvr_worker_once = PTHREAD_ONCE_INIT;
+
+static void *dvr_worker(void *arg);
+
+static void dvr_worker_create(void) {
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, dvr_worker, NULL) == 0)
+        pthread_detach(tid);
+    else
+        dvr_worker_failed = true;
+}
+
+// false if the command was not queued: the caller runs it itself.
+static bool dvr_enqueue(dvr_op_t op) {
+    if (!perf_opt.dvr_async)
+        return false;
+    pthread_once(&dvr_worker_once, dvr_worker_create);
+    if (dvr_worker_failed)
+        return false;
+
+    pthread_mutex_lock(&dvr_queue_mutex);
+    bool queued = dvr_queue_count < DVR_QUEUE_LEN;
+    if (queued) {
+        dvr_queue[(dvr_queue_head + dvr_queue_count) % DVR_QUEUE_LEN] = op;
+        dvr_queue_count++;
+        pthread_cond_signal(&dvr_queue_cond);
+    }
+    pthread_mutex_unlock(&dvr_queue_mutex);
+    if (!queued)
+        LOGE("dvr: command queue full");
+    return queued;
+}
+
+static bool dvr_worker_idle(void) {
+    pthread_mutex_lock(&dvr_queue_mutex);
+    bool idle = !dvr_worker_busy && dvr_queue_count == 0;
+    pthread_mutex_unlock(&dvr_queue_mutex);
+    return idle;
+}
+
+///////////////////////////////////////////////////////////////////
 //-1=error;
 // 0=idle,1=recording,2=stopped,3=No SD card,4=recorf file path error,
 // 5=SD card Full,6=Encoder error,7=Open Record File Failed
 void dvr_update_status() {
     pthread_mutex_lock(&dvr_mutex);
-    if (dvr_is_recording) {
+    // The record process may not have caught up with a queued start or stop.
+    if (dvr_is_recording && (!perf_opt.dvr_async || dvr_worker_idle())) {
         int ret = -1;
         FILE *fp = fopen("/tmp/record.dat", "r");
         if (fp) {
@@ -89,31 +183,28 @@ void dvr_update_status() {
         }
         if (ret != 1) {
             dvr_is_recording = false;
-            system_script(REC_STOP);
             record_pending = false;
-            sleep(2);                         // wait for record process
+            if (!dvr_enqueue(DVR_OP_STOP)) {
+                system_script(REC_STOP);
+                sleep(2); // wait for record process
+            }
         }
     }
     pthread_mutex_unlock(&dvr_mutex);
 }
 
 void dvr_enable_line_out(bool enable) {
-    char buf[128];
     if (enable) {
         live_audio_line_out_enabled = true;
         live_audio_muted_for_dvr = false; // path below is fully reopened
-        snprintf(buf, sizeof(buf), "%s out_on", AUDIO_SEL_SH);
-        system_exec(buf);
+        audio_sel("out_on");
         dvr_set_live_audio_volume(g_setting.record.live_audio_volume);
-        snprintf(buf, sizeof(buf), "%s out_linein_on", AUDIO_SEL_SH);
-        system_exec(buf);
-        snprintf(buf, sizeof(buf), "%s out_dac_off", AUDIO_SEL_SH);
-        system_exec(buf);
+        audio_sel("out_linein_on");
+        audio_sel("out_dac_off");
     } else {
         live_audio_line_out_enabled = false;
         live_audio_muted_for_dvr = false;
-        snprintf(buf, sizeof(buf), "%s out_off", AUDIO_SEL_SH);
-        system_exec(buf);
+        audio_sel("out_off");
     }
 }
 
@@ -142,7 +233,6 @@ static int live_volume_to_lineout(int volume) {
 }
 
 void dvr_set_dvr_audio_volume(int volume) {
-    char buf[128];
     int hardware_volume;
     int dac_volume;
 
@@ -160,18 +250,13 @@ void dvr_set_dvr_audio_volume(int volume) {
     else
         dac_volume = (hardware_volume * 160 + 15) / 31;
 
-    snprintf(buf, sizeof(buf), "amixer cset name='lineout volume' %d", hardware_volume);
-    system_exec(buf);
-    snprintf(buf, sizeof(buf), "amixer cset name='DAC volume' %d,%d", dac_volume, dac_volume);
-    system_exec(buf);
-    snprintf(buf, sizeof(buf), "amixer cset name='AIF1 DAC timeslot 0 volume' %d,%d", dac_volume, dac_volume);
-    system_exec(buf);
-    snprintf(buf, sizeof(buf), "amixer cset name='AIF1 DAC timeslot 1 volume' %d,%d", dac_volume, dac_volume);
-    system_exec(buf);
+    mixer_set("lineout volume", hardware_volume);
+    mixer_set2("DAC volume", dac_volume, dac_volume);
+    mixer_set2("AIF1 DAC timeslot 0 volume", dac_volume, dac_volume);
+    mixer_set2("AIF1 DAC timeslot 1 volume", dac_volume, dac_volume);
 }
 
 void dvr_set_live_audio_volume(int volume) {
-    char buf[128];
     int lineout_volume;
     int linein_gain;
 
@@ -181,10 +266,8 @@ void dvr_set_live_audio_volume(int volume) {
     if (volume > 0 && linein_gain == 0)
         linein_gain = 1;
 
-    snprintf(buf, sizeof(buf), "amixer cset name='lineout volume' %d", lineout_volume);
-    system_exec(buf);
-    snprintf(buf, sizeof(buf), "amixer cset name='LINEINL/R to L_R output mixer gain' %d", linein_gain);
-    system_exec(buf);
+    mixer_set("lineout volume", lineout_volume);
+    mixer_set("LINEINL/R to L_R output mixer gain", linein_gain);
 }
 
 static int clamp_record_gain(int gain) {
@@ -196,21 +279,14 @@ static int clamp_record_gain(int gain) {
 }
 
 void dvr_set_mic_gain(int gain) {
-    char buf[128];
-
     gain = clamp_record_gain(gain);
-    snprintf(buf, sizeof(buf), "amixer cset name='MIC1 boost AMP gain control' %d", gain);
-    system_exec(buf);
+    mixer_set("MIC1 boost AMP gain control", gain);
 }
 
 void dvr_set_linein_gain(int gain) {
-    char buf[128];
-
     gain = clamp_record_gain(gain);
-    snprintf(buf, sizeof(buf), "amixer cset name='ADC input gain control' %d", gain);
-    system_exec(buf);
-    snprintf(buf, sizeof(buf), "amixer cset name='MIC2 boost AMP gain control' %d", gain);
-    system_exec(buf);
+    mixer_set("ADC input gain control", gain);
+    mixer_set("MIC2 boost AMP gain control", gain);
 }
 
 static void dvr_apply_record_audio_gain(uint8_t source) {
@@ -244,36 +320,29 @@ void dvr_audio_route_unlock(void) {
 }
 
 void dvr_mute_live_audio(void) {
-    char buf[128];
-
     dvr_audio_route_lock();
 
     // Unconditional on purpose: live_audio_line_out_enabled can go stale
     // (boot never sets it, and a source switch mid audio-test can desync it),
     // and a skipped mute here means live audio mixes into DVR playback.
     // Cutting LINEIN with the line out already off is harmless.
-    snprintf(buf, sizeof(buf), "%s out_linein_off", AUDIO_SEL_SH);
-    system_exec(buf);
-    system_exec("amixer cset name='LINEINL/R to L_R output mixer gain' 0");
+    audio_sel("out_linein_off");
+    mixer_cset("LINEINL/R to L_R output mixer gain", "0");
     live_audio_muted_for_dvr = true;
     dvr_audio_route_unlock();
 }
 
 void dvr_restore_live_audio(void) {
-    char buf[128];
-
     dvr_audio_route_lock();
     if (live_audio_muted_for_dvr && live_audio_line_out_enabled) {
         dvr_set_live_audio_volume(g_setting.record.live_audio_volume);
-        snprintf(buf, sizeof(buf), "%s out_linein_on", AUDIO_SEL_SH);
-        system_exec(buf);
+        audio_sel("out_linein_on");
         live_audio_muted_for_dvr = false;
     }
     dvr_audio_route_unlock();
 }
 
 void dvr_select_audio_source(uint8_t source) {
-    char buf[128];
     char *audio_source[3] = {
         "in_mic1",
         "in_mic2",
@@ -281,96 +350,98 @@ void dvr_select_audio_source(uint8_t source) {
 
     if (source > 2)
         source = 2;
-    snprintf(buf, sizeof(buf), "%s %s", AUDIO_SEL_SH, audio_source[source]);
-    system_exec(buf);
+    audio_sel(audio_source[source]);
     dvr_apply_record_audio_gain(source);
 }
 
 // video input config
 void dvr_update_vi_conf(video_resolution_t fmt) {
     pthread_mutex_lock(&dvr_mutex);
+    rec_conf_dirty = false;
     switch (fmt) {
     case VR_720P50:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 50, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 50);
         break;
     case VR_720P60:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 60, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 60);
         break;
     case VR_720P30:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 30, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 30);
         break;
     case VR_540P90:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 90, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 90);
         break;
     case VR_540P60:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 60, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 60);
         break;
     case VR_960x720P60:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 60, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 60);
         break;
     case VR_540P90_CROP:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 90, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 90);
         break;
 #if defined(HDZGOGGLE) || defined(HDZGOGGLE2)
     case VR_1080P30:
-        ini_putl("vi", "width", 1920, REC_CONF);
-        ini_putl("vi", "height", 1080, REC_CONF);
-        ini_putl("vi", "fps", 30, REC_CONF);
+        rec_conf_putl("vi", "width", 1920);
+        rec_conf_putl("vi", "height", 1080);
+        rec_conf_putl("vi", "fps", 30);
         break;
     case VR_1080P24:
-        ini_putl("vi", "width", 1920, REC_CONF);
-        ini_putl("vi", "height", 1080, REC_CONF);
-        ini_putl("vi", "fps", 50, REC_CONF);
+        rec_conf_putl("vi", "width", 1920);
+        rec_conf_putl("vi", "height", 1080);
+        rec_conf_putl("vi", "fps", 50);
         break;
     case VR_1080P50:
-        ini_putl("vi", "width", 1920, REC_CONF);
-        ini_putl("vi", "height", 1080, REC_CONF);
-        ini_putl("vi", "fps", 50, REC_CONF);
+        rec_conf_putl("vi", "width", 1920);
+        rec_conf_putl("vi", "height", 1080);
+        rec_conf_putl("vi", "fps", 50);
         break;
     case VR_1080P60:
-        ini_putl("vi", "width", 1920, REC_CONF);
-        ini_putl("vi", "height", 1080, REC_CONF);
-        ini_putl("vi", "fps", 59, REC_CONF); // If set fps to 60, DVR is wrong. I don't know why. 59 or 61 is ok.
+        rec_conf_putl("vi", "width", 1920);
+        rec_conf_putl("vi", "height", 1080);
+        rec_conf_putl("vi", "fps", 59); // If set fps to 60, DVR is wrong. I don't know why. 59 or 61 is ok.
         break;
 #elif defined HDZBOXPRO
     case VR_1080P30:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 60, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 60);
         break;
     case VR_1080P24:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 50, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 50);
         break;
     case VR_1080P50:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 50, REC_CONF);
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 50);
         break;
     case VR_1080P60:
-        ini_putl("vi", "width", 1280, REC_CONF);
-        ini_putl("vi", "height", 720, REC_CONF);
-        ini_putl("vi", "fps", 59, REC_CONF); // If set fps to 60, DVR is wrong. I don't know why. 59 or 61 is ok.
+        rec_conf_putl("vi", "width", 1280);
+        rec_conf_putl("vi", "height", 720);
+        rec_conf_putl("vi", "fps", 59); // If set fps to 60, DVR is wrong. I don't know why. 59 or 61 is ok.
         break;
 #endif
     }
+    bool written = rec_conf_dirty;
     pthread_mutex_unlock(&dvr_mutex);
-    sync();
+    if (written || !perf_opt.dvr_async)
+        sync();
 
     LOGI("update_record_vi_conf: fmt=%d", fmt);
 }
@@ -429,6 +500,7 @@ static void dvr_dbg_log(const char *fmt, ...) {
 }
 
 static void dvr_update_record_conf() {
+    rec_conf_dirty = false;
     int bitrate_num = 1;
     int bitrate_den = 1;
     switch (g_setting.record.bitrate_scale) {
@@ -451,98 +523,98 @@ static void dvr_update_record_conf() {
         break;
     }
     if (g_setting.record.format_ts)
-        ini_puts("record", "type", "ts", REC_CONF);
+        rec_conf_puts("record", "type", "ts");
     else
-        ini_puts("record", "type", "mp4", REC_CONF);
+        rec_conf_puts("record", "type", "mp4");
 
     if (g_source_info.source == SOURCE_HDZERO) {
         LOGI("CAM_MODE=%d", CAM_MODE);
         if (CAM_MODE == VR_1080P30 || CAM_MODE == VR_1080P24) {
-            ini_putl("venc", "width", 1920, REC_CONF);
-            ini_putl("venc", "height", 1080, REC_CONF);
+            rec_conf_putl("venc", "width", 1920);
+            rec_conf_putl("venc", "height", 1080);
         } else {
-            ini_putl("venc", "width", 1280, REC_CONF);
-            ini_putl("venc", "height", 720, REC_CONF);
+            rec_conf_putl("venc", "width", 1280);
+            rec_conf_putl("venc", "height", 720);
         }
 
         if (CAM_MODE == VR_1080P30) { // 1080p30
-            ini_putl("venc", "fps", 60, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "fps", 60);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
         } else if (CAM_MODE == VR_1080P24) { // 1080p24
-            ini_putl("venc", "fps", 50, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "fps", 50);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
         } else if (CAM_MODE == VR_540P90 || CAM_MODE == VR_540P90_CROP) { // 90fps
-            ini_putl("venc", "fps", 90, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "fps", 90);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
         } else {
-            ini_putl("venc", "fps", 60, REC_CONF);
-            ini_putl("venc", "kbps", 24000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 1, REC_CONF);
+            rec_conf_putl("venc", "fps", 60);
+            rec_conf_putl("venc", "kbps", 24000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 1);
         }
     } else if (g_source_info.source == SOURCE_AV_IN || g_source_info.source == SOURCE_AV_MODULE) { // Analog
-        ini_putl("venc", "width", 1280, REC_CONF);
-        ini_putl("venc", "height", 720, REC_CONF);
+        rec_conf_putl("venc", "width", 1280);
+        rec_conf_putl("venc", "height", 720);
 
-        ini_putl("venc", "kbps", 24000 * bitrate_num / bitrate_den, REC_CONF);
-        ini_putl("venc", "h265", 1, REC_CONF);
+        rec_conf_putl("venc", "kbps", 24000 * bitrate_num / bitrate_den);
+        rec_conf_putl("venc", "h265", 1);
         if (g_hw_stat.av_pal[g_hw_stat.is_av_in])
-            ini_putl("venc", "fps", 50, REC_CONF);
+            rec_conf_putl("venc", "fps", 50);
         else
-            ini_putl("venc", "fps", 60, REC_CONF);
+            rec_conf_putl("venc", "fps", 60);
     } else if (g_source_info.source == SOURCE_HDMI_IN) {
         LOGI("g_hw_stat.hdmiin_vtmg=%d", g_hw_stat.hdmiin_vtmg);
         switch (g_hw_stat.hdmiin_vtmg) {
         case HDMIIN_VTMG_1080P60:
-            ini_putl("venc", "width", 1920, REC_CONF);
-            ini_putl("venc", "height", 1080, REC_CONF);
-            ini_putl("venc", "fps", 60, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "width", 1920);
+            rec_conf_putl("venc", "height", 1080);
+            rec_conf_putl("venc", "fps", 60);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
             break;
         case HDMIIN_VTMG_1080P50:
-            ini_putl("venc", "width", 1920, REC_CONF);
-            ini_putl("venc", "height", 1080, REC_CONF);
-            ini_putl("venc", "fps", 50, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "width", 1920);
+            rec_conf_putl("venc", "height", 1080);
+            rec_conf_putl("venc", "fps", 50);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
             break;
         case HDMIIN_VTMG_1080Pother:
-            ini_putl("venc", "width", 1920, REC_CONF);
-            ini_putl("venc", "height", 1080, REC_CONF);
-            ini_putl("venc", "fps", 50, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "width", 1920);
+            rec_conf_putl("venc", "height", 1080);
+            rec_conf_putl("venc", "fps", 50);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
             break;
         case HDMIIN_VTMG_720P50:
-            ini_putl("venc", "width", 1280, REC_CONF);
-            ini_putl("venc", "height", 720, REC_CONF);
-            ini_putl("venc", "fps", 50, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "width", 1280);
+            rec_conf_putl("venc", "height", 720);
+            rec_conf_putl("venc", "fps", 50);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
             break;
         case HDMIIN_VTMG_720P60:
-            ini_putl("venc", "width", 1280, REC_CONF);
-            ini_putl("venc", "height", 720, REC_CONF);
-            ini_putl("venc", "fps", 60, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "width", 1280);
+            rec_conf_putl("venc", "height", 720);
+            rec_conf_putl("venc", "fps", 60);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
             break;
         case HDMIIN_VTMG_720P100:
-            ini_putl("venc", "width", 1280, REC_CONF);
-            ini_putl("venc", "height", 720, REC_CONF);
-            ini_putl("venc", "fps", 90, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "width", 1280);
+            rec_conf_putl("venc", "height", 720);
+            rec_conf_putl("venc", "fps", 90);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
             break;
         default:
-            ini_putl("venc", "width", 1280, REC_CONF);
-            ini_putl("venc", "height", 720, REC_CONF);
-            ini_putl("venc", "fps", 60, REC_CONF);
-            ini_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den, REC_CONF);
-            ini_putl("venc", "h265", 0, REC_CONF);
+            rec_conf_putl("venc", "width", 1280);
+            rec_conf_putl("venc", "height", 720);
+            rec_conf_putl("venc", "fps", 60);
+            rec_conf_putl("venc", "kbps", 34000 * bitrate_num / bitrate_den);
+            rec_conf_putl("venc", "h265", 0);
             break;
         }
     }
@@ -552,21 +624,21 @@ static void dvr_update_record_conf() {
     // and QP floor to both codecs so changing source or codec cannot leave
     // stale encoder parameters behind.
     bool const use_vbr = (g_setting.record.rc_mode == SETTING_RECORD_RC_VBR);
-    ini_putl("venc", "rc", use_vbr ? 1 : 0, REC_CONF);
+    rec_conf_putl("venc", "rc", use_vbr ? 1 : 0);
     for (int i = 0; i < 2; i++) {
         const char *sec = i ? "h265" : "h264";
         if (use_vbr) {
-            ini_putl(sec, "quality", g_setting.record.vbr_quality, REC_CONF);
-            ini_putl(sec, "maxQP", g_setting.record.vbr_max_qp, REC_CONF);
+            rec_conf_putl(sec, "quality", g_setting.record.vbr_quality);
+            rec_conf_putl(sec, "maxQP", g_setting.record.vbr_max_qp);
         } else {
-            ini_putl(sec, "maxQP", 52, REC_CONF);
+            rec_conf_putl(sec, "maxQP", 52);
         }
     }
 
-    ini_putl("record", "audio", g_setting.record.audio, REC_CONF);
+    rec_conf_putl("record", "audio", g_setting.record.audio);
     dvr_select_audio_source(g_setting.record.audio_source);
-    ini_putl("record", "naming", g_setting.record.naming, REC_CONF);
-    ini_putl("record", "rolling", g_setting.record.rolling ? 1 : 0, REC_CONF);
+    rec_conf_putl("record", "naming", g_setting.record.naming);
+    rec_conf_putl("record", "rolling", g_setting.record.rolling ? 1 : 0);
 
     // Only the ELRS naming scheme consumes race labels. Clear the pending
     // label when another scheme is selected so it cannot leak into a later
@@ -576,9 +648,10 @@ static void dvr_update_record_conf() {
     } else if (dvr_race_label[0] && time(NULL) - dvr_race_label_time > DVR_RACE_LABEL_TTL_S) {
         dvr_race_label[0] = 0;
     }
-    ini_puts("record", "label", g_setting.record.naming == SETTING_NAMING_ELRS ? dvr_race_label : "", REC_CONF);
+    rec_conf_puts("record", "label", g_setting.record.naming == SETTING_NAMING_ELRS ? dvr_race_label : "");
 
-    sync();
+    if (rec_conf_dirty || !perf_opt.dvr_async)
+        sync();
 
     // The record daemon picks the clip container purely from this "type" key
     // and silently falls back to "ts" if the value is missing or unrecognised.
@@ -604,6 +677,66 @@ static void dvr_update_record_conf() {
 
 bool dvr_space_allows_start(void) {
     return g_setting.record.rolling || !sdcard_is_full();
+}
+
+// Re-assert the record-OSD bit at the exact point recording starts.
+// Display/UI transitions can reinitialize this FPGA register after
+// source entry, so the source-entry write alone is not sufficient.
+//
+// Not on HDMI In on the goggles: Source_HDMI_in() runs that session
+// with the overlay plane switched off, and re-asserting the bit here
+// turned it back on part-way through -- an overlay the rest of the
+// session is not set up for.
+static void dvr_reassert_record_osd(void) {
+    bool reassert_osd = true;
+#if defined(HDZGOGGLE) || defined(HDZGOGGLE2)
+    reassert_osd = (g_source_info.source != SOURCE_HDMI_IN);
+#endif
+    if (reassert_osd) {
+        Display_Osd(g_setting.record.osd);
+        uint8_t osd_reg = Display_Osd_Readback();
+        LOGI("dvr record OSD: requested=%d readback=0x%02x",
+             g_setting.record.osd, osd_reg);
+    }
+}
+
+// The steps of a start once the state says recording, as the synchronous
+// path does them, minus its locking.
+static void dvr_worker_start_recording(void) {
+    pthread_mutex_lock(&dvr_mutex);
+    dvr_update_record_conf();
+    pthread_mutex_unlock(&dvr_mutex);
+    dvr_reassert_record_osd();
+    usleep(100 * 1000);
+    system_script(REC_START);
+    pthread_mutex_lock(&dvr_mutex);
+    dvr_recording_start = time(NULL);
+    pthread_mutex_unlock(&dvr_mutex);
+}
+
+static void *dvr_worker(void *arg) {
+    perf_thread_name("dvr");
+    for (;;) {
+        pthread_mutex_lock(&dvr_queue_mutex);
+        while (dvr_queue_count == 0)
+            pthread_cond_wait(&dvr_queue_cond, &dvr_queue_mutex);
+        dvr_op_t op = dvr_queue[dvr_queue_head];
+        dvr_queue_head = (dvr_queue_head + 1) % DVR_QUEUE_LEN;
+        dvr_queue_count--;
+        dvr_worker_busy = true;
+        pthread_mutex_unlock(&dvr_queue_mutex);
+
+        if (op == DVR_OP_START)
+            dvr_worker_start_recording();
+        else
+            system_script(REC_STOP);
+        sleep(2); // wait for record process
+
+        pthread_mutex_lock(&dvr_queue_mutex);
+        dvr_worker_busy = false;
+        pthread_mutex_unlock(&dvr_queue_mutex);
+    }
+    return NULL;
 }
 
 void dvr_cmd(osd_dvr_cmd_t cmd) {
@@ -632,42 +765,32 @@ void dvr_cmd(osd_dvr_cmd_t cmd) {
 
     if (start_rec) {
         if (!dvr_is_recording && dvr_space_allows_start()) {
-            dvr_update_record_conf();
-            // Re-assert the record-OSD bit at the exact point recording starts.
-            // Display/UI transitions can reinitialize this FPGA register after
-            // source entry, so the source-entry write alone is not sufficient.
-            //
-            // Not on HDMI In on the goggles: Source_HDMI_in() runs that session
-            // with the overlay plane switched off, and re-asserting the bit here
-            // turned it back on part-way through -- an overlay the rest of the
-            // session is not set up for.
-            bool reassert_osd = true;
-#if defined(HDZGOGGLE) || defined(HDZGOGGLE2)
-            reassert_osd = (g_source_info.source != SOURCE_HDMI_IN);
-#endif
-            if (reassert_osd) {
-                Display_Osd(g_setting.record.osd);
-                uint8_t osd_reg = Display_Osd_Readback();
-                LOGI("dvr record OSD: requested=%d readback=0x%02x",
-                     g_setting.record.osd, osd_reg);
-            }
-            if (g_sdcard_ready) {
+            if (g_sdcard_ready && dvr_enqueue(DVR_OP_START)) {
                 dvr_is_recording = true;
                 record_pending = false;
-                usleep(100 * 1000);
-                system_script(REC_START);
-                dvr_recording_start = time(NULL);
-                sleep(2); // wait for record process
             } else {
-                record_pending = true;
+                dvr_update_record_conf();
+                dvr_reassert_record_osd();
+                if (g_sdcard_ready) {
+                    dvr_is_recording = true;
+                    record_pending = false;
+                    usleep(100 * 1000);
+                    system_script(REC_START);
+                    dvr_recording_start = time(NULL);
+                    sleep(2); // wait for record process
+                } else {
+                    record_pending = true;
+                }
             }
         }
     } else {
         if (dvr_is_recording) {
             dvr_is_recording = false;
             dvr_dbg_log("stop_request cmd=%d", cmd);
-            system_script(REC_STOP);
-            sleep(2); // wait for record process
+            if (!dvr_enqueue(DVR_OP_STOP)) {
+                system_script(REC_STOP);
+                sleep(2); // wait for record process
+            }
         }
     }
 

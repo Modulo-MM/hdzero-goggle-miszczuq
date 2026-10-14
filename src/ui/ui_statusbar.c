@@ -1,4 +1,5 @@
 #include "ui/ui_statusbar.h"
+#include "ui/ui_lazy.h"
 
 #include <stdio.h>
 
@@ -203,92 +204,109 @@ int statusbar_init(void) {
     return 0;
 }
 
+// The plain low-battery beep and the gradual critical-stage beep repeat every
+// BEEP_INTERVAL_MS / BEEP_INTERVAL_RAPID_MS while the condition lasts, the
+// first one an interval after it began (so a momentary dip, e.g. at power-on,
+// does not beep). These were counts of main-loop passes (20 and 10), and a
+// pass took ~75 ms while every pass redrew the whole screen (the sleep
+// reminder's 4000 passes were "about five minutes"); with the screen redrawn
+// only on changes a pass is ~5 ms, and counting passes beeped ~10 times a
+// second. Wall-clock time keeps the old cadence whatever the loop rate.
+#define BEEP_INTERVAL_MS       1500
+#define BEEP_INTERVAL_RAPID_MS 750
+
+static void low_battery_beep(bool on, uint32_t interval_ms) {
+    static bool was_on = false;
+    static uint32_t last_beep = 0;
+    uint32_t now = lv_tick_get();
+
+    if (!on) {
+        was_on = false;
+        return;
+    }
+    if (!was_on) {
+        was_on = true;
+        last_beep = now;
+        return;
+    }
+    if (now - last_beep >= interval_ms) {
+        beep();
+        last_beep = now;
+    }
+}
+
 void statubar_update(void) {
     char buf[128];
     memset(buf, 0, sizeof(buf));
 
     // display battery voltage
     battery_get_voltage_str(buf);
-    lv_label_set_text(label[STS_BATT], buf);
+    lazy_label_set_text(label[STS_BATT], buf);
 
     {
-#define BEEP_INTERVAL 20
-#define BEEP_INTERVAL_RAPID 10
 #define GRADUAL_SLOW_BEEP_MS 20000
 #define GRADUAL_SLOW_CONFIRM_MS 3000
 #define GRADUAL_RAPID_BEEP_MS 1000
 #define GRADUAL_BLINK_MS 400
-        static uint8_t beep_gap = 0;
-
         const bool low = battery_is_low();
-        if (low)
-            lv_img_set_src(img_battery, &img_lowBattery);
-        else
-            lv_img_set_src(img_battery, &img_bat);
+        const lv_img_dsc_t *icon = low ? &img_lowBattery : &img_bat;
         // default both the icon and the voltage text to visible; the gradual
         // rapid/critical stages hide them on alternate phases to blink them
-        lv_obj_clear_flag(img_battery, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(label[STS_BATT], LV_OBJ_FLAG_HIDDEN);
+        bool icon_hidden = false;
+        bool text_hidden = false;
+        bool beeping = false; // low_battery_beep() condition
+        uint32_t beep_interval_ms = BEEP_INTERVAL_MS;
 
         switch (g_setting.power.warning_type) {
         case SETTING_POWER_WARNING_TYPE_BEEP:
             if (low) {
-                if (beep_gap++ == BEEP_INTERVAL) {
-                    beep();
-                    beep_gap = 0;
-                }
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_hex(TEXT_COLOR_DEFAULT), 0);
+                beeping = true;
+                lazy_text_color(label[STS_BATT], lv_color_hex(TEXT_COLOR_DEFAULT));
             }
             break;
 
         case SETTING_POWER_WARNING_TYPE_VISUAL:
             if (low)
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_make(255, 0, 0), 0);
+                lazy_text_color(label[STS_BATT], lv_color_make(255, 0, 0));
             else
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_hex(TEXT_COLOR_DEFAULT), 0);
+                lazy_text_color(label[STS_BATT], lv_color_hex(TEXT_COLOR_DEFAULT));
             break;
 
         case SETTING_POWER_WARNING_TYPE_BOTH:
             if (low) {
-                if (beep_gap++ == BEEP_INTERVAL) {
-                    beep();
-                    beep_gap = 0;
-                }
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_make(255, 0, 0), 0);
+                beeping = true;
+                lazy_text_color(label[STS_BATT], lv_color_make(255, 0, 0));
             } else
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_hex(TEXT_COLOR_DEFAULT), 0);
+                lazy_text_color(label[STS_BATT], lv_color_hex(TEXT_COLOR_DEFAULT));
             break;
         case SETTING_POWER_WARNING_TYPE_GRADUAL: {
             const battery_warn_level_t lvl = battery_warn_level();
             const bool blink_off = (lv_tick_get() / GRADUAL_BLINK_MS) % 2;
 
             // icon: low-battery from the slow stage onward, normal otherwise
-            if (lvl >= BATTERY_WARN_SLOW)
-                lv_img_set_src(img_battery, &img_lowBattery);
-            else
-                lv_img_set_src(img_battery, &img_bat);
+            icon = lvl >= BATTERY_WARN_SLOW ? &img_lowBattery : &img_bat;
 
             // blink the icon at the rapid and critical stages (it was made
             // visible before the switch; hide it on alternate phases)
             if (lvl >= BATTERY_WARN_RAPID && blink_off)
-                lv_obj_add_flag(img_battery, LV_OBJ_FLAG_HIDDEN);
+                icon_hidden = true;
 
             // text color: amber (subtle) -> orange (slow) -> red (rapid) ->
             // dark red (critical, below the warning voltage)
             if (lvl == BATTERY_WARN_SUBTLE)
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_make(255, 191, 0), 0); // amber
+                lazy_text_color(label[STS_BATT], lv_color_make(255, 191, 0)); // amber
             else if (lvl == BATTERY_WARN_SLOW)
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_make(255, 128, 0), 0); // orange
+                lazy_text_color(label[STS_BATT], lv_color_make(255, 128, 0)); // orange
             else if (lvl == BATTERY_WARN_RAPID)
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_make(255, 0, 0), 0); // red
+                lazy_text_color(label[STS_BATT], lv_color_make(255, 0, 0)); // red
             else if (lvl == BATTERY_WARN_CRITICAL)
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_make(220, 0, 0), 0); // dark red
+                lazy_text_color(label[STS_BATT], lv_color_make(220, 0, 0)); // dark red
             else
-                lv_obj_set_style_text_color(label[STS_BATT], lv_color_hex(TEXT_COLOR_DEFAULT), 0);
+                lazy_text_color(label[STS_BATT], lv_color_hex(TEXT_COLOR_DEFAULT));
 
             // critical also blinks the voltage text, in sync with the icon
             if (lvl == BATTERY_WARN_CRITICAL && blink_off)
-                lv_obj_add_flag(label[STS_BATT], LV_OBJ_FLAG_HIDDEN);
+                text_hidden = true;
 
             // beep cadence per stage:
             //   slow     - one short beep every 20 s
@@ -322,16 +340,18 @@ void statubar_update(void) {
                     last_rapid_beep = now;
                 }
             } else if (lvl == BATTERY_WARN_CRITICAL) {
-                if (beep_gap++ >= BEEP_INTERVAL_RAPID) {
-                    beep();
-                    beep_gap = 0;
-                }
+                beeping = true;
+                beep_interval_ms = BEEP_INTERVAL_RAPID_MS;
             }
             break;
         }
         default:
             break;
         }
+        low_battery_beep(beeping, beep_interval_ms);
+        lazy_img_set_src(img_battery, icon);
+        lazy_hidden(img_battery, icon_hidden);
+        lazy_hidden(label[STS_BATT], text_hidden);
     }
 
     static int hdzero_channel_last = 0;
@@ -346,7 +366,7 @@ void statubar_update(void) {
          (auto_protocol_detect_last != g_setting.source.auto_protocol_detect))) {
         memset(buf, 0, sizeof(buf));
         statusbar_format_source(buf, sizeof(buf));
-        lv_label_set_text(label[STS_SOURCE], buf);
+        lazy_label_set_text(label[STS_SOURCE], buf);
     }
 
     hdzero_channel_last = g_setting.scan.channel;
@@ -356,13 +376,13 @@ void statubar_update(void) {
     auto_protocol_detect_last = g_setting.source.auto_protocol_detect;
 
     if (page_storage_is_sd_repair_active()) {
-        lv_img_set_src(img_sdc, &img_sdcard);
-        lv_label_set_text(label[STS_SDCARD], _lang("Integrity check"));
+        lazy_img_set_src(img_sdc, &img_sdcard);
+        lazy_label_set_text(label[STS_SDCARD], _lang("Integrity check"));
     } else if (-1 == g_bootup_sdcard_state) {
         if (g_sdcard_enable) {
             int cnt = get_videofile_cnt();
             float gb = sdcard_free_size() / 1024.0;
-            lv_img_set_src(img_sdc, &img_sdcard);
+            lazy_img_set_src(img_sdc, &img_sdcard);
             if (cnt != 0) {
                 if (sdcard_is_full())
                     snprintf(buf, sizeof(buf), "%d %s, %s %s", cnt, _lang("clip(s)"), _lang("SD Card"), _lang("full"));
@@ -375,7 +395,7 @@ void statubar_update(void) {
                     snprintf(buf, sizeof(buf), "%.2fGB %s", gb, _lang("available"));
             }
         } else {
-            lv_img_set_src(img_sdc, &img_noSdcard);
+            lazy_img_set_src(img_sdc, &img_noSdcard);
 
             if (sdcard_inserted()) {
                 strcpy(buf, _lang("Unsupported"));
@@ -384,19 +404,19 @@ void statubar_update(void) {
             }
         }
 
-        lv_label_set_text(label[STS_SDCARD], buf);
+        lazy_label_set_text(label[STS_SDCARD], buf);
     }
 
     if (g_setting.has_all_features) {
         if (g_setting.elrs.enable) {
             snprintf(buf, sizeof(buf), "ELRS: %s ", _lang("On"));
-            lv_label_set_text(label[STS_ELRS], buf);
+            lazy_label_set_text(label[STS_ELRS], buf);
         } else {
             snprintf(buf, sizeof(buf), "ELRS: %s ", _lang("Off"));
-            lv_label_set_text(label[STS_ELRS], buf);
+            lazy_label_set_text(label[STS_ELRS], buf);
         }
 
         page_wifi_get_statusbar_text(buf, sizeof(buf));
-        lv_label_set_text(label[STS_WIFI], buf);
+        lazy_label_set_text(label[STS_WIFI], buf);
     }
 }

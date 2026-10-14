@@ -10,6 +10,7 @@
 
 #include "../core/common.hh"
 #include "../core/defines.h"
+#include "core/perf_monitor.h"
 #include "driver/dm5680.h"
 #include "driver/gpio.h"
 #include "gpadc.h"
@@ -160,6 +161,7 @@ static void rtc6715_set_ch(int ch) {
 #endif
 
 void *thread_rtc6715_rssi(void *ptr) {
+    perf_thread_name("rssi");
     for (;;) {
 #if defined(HDZBOXPRO) || defined(HDZGOGGLE2)
         // Poll the Built-in receiver's RSSI whenever it is the active analog

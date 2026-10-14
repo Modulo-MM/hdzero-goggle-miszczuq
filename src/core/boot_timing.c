@@ -11,6 +11,7 @@
 
 #include <log/log.h>
 
+#include "core/common.hh"
 #include "core/settings.h"
 #include "platform/paths.h"
 #include "util/filesystem.h"
@@ -122,6 +123,15 @@ bool boot_opt(const char *name) {
     return enabled;
 }
 
+void boot_opt_summary(char *buf, int size) {
+    int len = 0;
+    buf[0] = 0;
+    pthread_mutex_lock(&opt_mutex);
+    for (int i = 0; i < opt_count && len < size; i++)
+        len += snprintf(buf + len, size - len, "%s%s=%s", i ? " " : "", opts[i].name, opts[i].enabled ? "ON" : "off");
+    pthread_mutex_unlock(&opt_mutex);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Sleep/wake timing
 
@@ -140,6 +150,9 @@ static atomic_bool wake_signal_seen = false;
 static atomic_bool wake_source_ready = false;
 static int wake_source = -1;
 static bool wake_fast = false;
+// The same report also times a source switch made in video (no sleep):
+// switch_from is the source it came from, -1 for a wake.
+static int switch_from = -1;
 
 void wake_timing_sleep(void) {
     wake_sleep_at = boot_now();
@@ -157,7 +170,8 @@ void wake_timing_mark(const char *tag) {
     }
     pthread_mutex_unlock(&wake_mutex);
 
-    if (strcmp(tag, "analog_rx_on") == 0 || strcmp(tag, "source_reentered") == 0)
+    if (strcmp(tag, "analog_rx_on") == 0 || strcmp(tag, "source_reentered") == 0 ||
+        strcmp(tag, "switch_done") == 0)
         wake_source_ready = true;
 }
 
@@ -172,11 +186,20 @@ static void wake_report_write(const char *path) {
 
     pthread_mutex_lock(&wake_mutex);
     double t0 = wake_mark_count ? wake_marks[0].t : 0;
-    fprintf(out, "\n===== WAKE TIMING REPORT %s (RTC) =====\n", wall);
-    fprintf(out, "platform: %s, source: %d, path: %s, slept: %.1f s\n", BOOT_TIMING_PLATFORM, wake_source,
-            wake_fast ? "fast (straight back to the source)" : "menu, then source re-entry",
-            wake_sleep_at > 0 ? t0 - wake_sleep_at : -1.0);
-    fprintf(out, "-- marks: seconds since wake --\n");
+    const char *what = switch_from >= 0 ? "switch" : "wake";
+    if (switch_from >= 0) {
+        fprintf(out, "\n===== SWITCH TIMING REPORT %s (RTC) =====\n", wall);
+        fprintf(out, "platform: %s, source: %d -> %d\n", BOOT_TIMING_PLATFORM, switch_from, wake_source);
+    } else {
+        fprintf(out, "\n===== WAKE TIMING REPORT %s (RTC) =====\n", wall);
+        fprintf(out, "platform: %s, source: %d, path: %s, slept: %.1f s\n", BOOT_TIMING_PLATFORM, wake_source,
+                wake_fast ? "fast (straight back to the source)" : "menu, then source re-entry",
+                wake_sleep_at > 0 ? t0 - wake_sleep_at : -1.0);
+    }
+    char opts_buf[256];
+    boot_opt_summary(opts_buf, sizeof(opts_buf));
+    fprintf(out, "boot options: %s\n", opts_buf[0] ? opts_buf : "(none queried)");
+    fprintf(out, "-- marks: seconds since %s --\n", what);
     double signal_at = -1;
     for (int i = 0; i < wake_mark_count; i++) {
         fprintf(out, "%8.3f  %s\n", wake_marks[i].t - t0, wake_marks[i].tag);
@@ -186,9 +209,9 @@ static void wake_report_write(const char *path) {
     pthread_mutex_unlock(&wake_mutex);
 
     if (signal_at >= 0)
-        fprintf(out, "wake -> first valid signal: %.3f s\n", signal_at);
+        fprintf(out, "%s -> first valid signal: %.3f s\n", what, signal_at);
     else
-        fprintf(out, "wake -> first valid signal: none within %d s\n", WAKE_TIMEOUT_S);
+        fprintf(out, "%s -> first valid signal: none within %d s\n", what, WAKE_TIMEOUT_S);
     fprintf(out, "===== END =====\n");
     fflush(out);
     fsync(fileno(out));
@@ -216,25 +239,40 @@ static void *wake_report_thread(void *arg) {
     return NULL;
 }
 
-void wake_timing_wake(int source, bool fast) {
+static void transition_begin(int source, bool fast, int from) {
     pthread_mutex_lock(&wake_mutex);
     wake_generation++;
     wake_mark_count = 0;
     wake_source = source;
     wake_fast = fast;
+    switch_from = from;
     int generation = wake_generation;
     pthread_mutex_unlock(&wake_mutex);
 
     wake_signal_seen = false;
     wake_source_ready = false;
     wake_active = true;
-    wake_timing_mark("wake_begin");
+    wake_timing_mark(from >= 0 ? "switch_begin" : "wake_begin");
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, wake_report_thread, (void *)(intptr_t)generation) == 0)
         pthread_detach(tid);
     else
         wake_active = false;
+}
+
+void wake_timing_wake(int source, bool fast) {
+    transition_begin(source, fast, -1);
+}
+
+void switch_timing_begin(int from, int to) {
+    if (!g_init_done)
+        return; // the boot report covers the initial entry
+    // A wake re-enters its source through the same switch functions: that
+    // wake's report is already running until its source_reentered mark.
+    if (wake_active && switch_from < 0 && !wake_source_ready)
+        return;
+    transition_begin(to, false, from < 0 ? 0 : from);
 }
 
 void boot_timing_signal(bool is_valid, int source) {

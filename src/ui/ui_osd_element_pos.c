@@ -1,4 +1,5 @@
 #include "ui/ui_osd_element_pos.h"
+#include "ui/ui_lazy.h"
 
 #include <stdio.h>
 
@@ -619,9 +620,9 @@ void ui_osd_element_pos_on_enter() {
 
 void ui_osd_element_pos_update() {
     if (show_osd_element_pos_ui)
-        lv_obj_clear_flag(ui_root_container, LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(ui_root_container, false);
     else
-        lv_obj_add_flag(ui_root_container, LV_OBJ_FLAG_HIDDEN);
+        lazy_hidden(ui_root_container, true);
 }
 
 void ui_osd_element_pos_cancel_and_hide() {

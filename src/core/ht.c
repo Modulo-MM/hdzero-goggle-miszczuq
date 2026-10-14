@@ -19,6 +19,7 @@
 #include "osd.h"
 
 #include "bmi270/accel_gyro.h"
+#include "core/perf_monitor.h"
 #include "core/settings.h"
 #include "core/sleep_mode.h"
 #include "driver/beep.h"
@@ -47,6 +48,30 @@ static bool is_moving = true;
 
 static volatile bool calibrating = false;
 static int calibration_count = 0;
+
+// imu_lazy (perf_opt): with head tracking off and no calibration running,
+// the IMU only feeds the once-a-second motion check (OLED auto-off), so its
+// timer runs at 1 Hz instead of AHRS_UPDATE_FREQUENCY.
+static timer_t imu_timer;
+static bool imu_timer_ok = false;
+static volatile bool imu_slow = false; // timer at 1 Hz: every tick is a motion-check tick
+static pthread_mutex_t imu_rate_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void imu_timer_update_rate(void) {
+    pthread_mutex_lock(&imu_rate_mutex);
+    bool slow = perf_opt.imu_lazy && !ht_data.enable && !calibrating;
+    if (imu_timer_ok && slow != imu_slow) {
+        struct itimerspec its = {.it_value.tv_sec = 0,
+                                 .it_value.tv_nsec = 1000000000 / AHRS_UPDATE_FREQUENCY,
+                                 .it_interval.tv_sec = slow ? 1 : 0,
+                                 .it_interval.tv_nsec = slow ? 0 : 1000000000 / AHRS_UPDATE_FREQUENCY};
+        if (timer_settime(imu_timer, 0, &its, NULL) == 0)
+            imu_slow = slow;
+        else
+            LOGE("imu timer rate: %s", strerror(errno));
+    }
+    pthread_mutex_unlock(&imu_rate_mutex);
+}
 
 // Runtime gyro-bias tracking. The one-shot calibration stores an integer-LSB
 // offset (gyr_offset); at +-2000 dps that floor leaves up to ~1.8 deg/min of
@@ -196,16 +221,25 @@ void ht_detect_motion() {
     }
 }
 
-static void get_imu_data() {
+// Returns true if it read a fresh sample this tick.
+static bool get_imu_data() {
     static int dec_cnt = 0;
 
+    // imu_lazy (perf_opt): with head tracking off and no calibration running,
+    // only the once-a-second motion check below uses the IMU, so the other 99
+    // ticks skip the two I2C transfers of a read. That check keeps comparing
+    // samples taken 1 s apart, as before.
+    if (imu_slow)
+        dec_cnt = AHRS_UPDATE_FREQUENCY - 1; // 1 Hz timer: each tick is the 1 s tick
+    bool fresh = !perf_opt.imu_lazy || ht_data.enable || calibrating || dec_cnt == AHRS_UPDATE_FREQUENCY - 1;
 #ifndef EMULATOR_BUILD
-    get_bmi270(&ht_data.sensor_data);
+    if (fresh)
+        get_bmi270(&ht_data.sensor_data);
 #endif
 
     dec_cnt++;
     if (dec_cnt != AHRS_UPDATE_FREQUENCY)
-        return; // calibrate dec_cnt to make sure the following code runs at 1Hz
+        return fresh; // calibrate dec_cnt to make sure the following code runs at 1Hz
     dec_cnt = 0;
 
     static struct bmi2_sens_axes_data gyr_last;
@@ -222,15 +256,21 @@ static void get_imu_data() {
     gyr_last = ht_data.sensor_data.gyr;
 
     has_motion_data = true;
+    return fresh;
 }
 
 static void timer_callback_imu(union sigval timer_data) {
+    static bool named = false;
+    if (!named) {
+        named = true;
+        perf_thread_name("imu"); // the timer's own thread
+    }
 #ifndef EMULATOR_BUILD
     if (!bmi270_ready())
         return; // still being configured at boot (see device_init)
 #endif
-    get_imu_data();
-    calculate_orientation();
+    if (get_imu_data())
+        calculate_orientation(); // a no-op on a stale sample: tracking is off
 }
 
 /////////////////////////////////////////////////////////////////////////////////
@@ -283,7 +323,10 @@ void ht_init() {
     res = timer_settime(timerId, 0, &its, NULL);
     if (res != 0) {
         LOGE("Error timer_settime: %s\n", strerror(errno));
+        return;
     }
+    imu_timer = timerId;
+    imu_timer_ok = true;
 }
 
 void ht_set_maxangle(int angle) {
@@ -326,10 +369,12 @@ void ht_calibrate() {
 
     calibration_count = 0;
     calibrating = true;
+    imu_timer_update_rate(); // full rate while calibrating
     // Check if finished calibrating
     while (calibrating) {
         usleep(100000);
     }
+    imu_timer_update_rate();
     ht_data.acc_offset[0] >>= CALIBRATION_BCNT;
     ht_data.acc_offset[1] >>= CALIBRATION_BCNT;
     ht_data.acc_offset[2] >>= CALIBRATION_BCNT;
@@ -460,11 +505,13 @@ void ht_set_center_position() {
 void ht_enable() {
     ht_data.enable = 1;
     Set_HT_status(ht_data.enable, frame_period, sync_len);
+    imu_timer_update_rate();
 }
 
 void ht_disable() {
     ht_data.enable = 0;
     Set_HT_status(ht_data.enable, frame_period, sync_len);
+    imu_timer_update_rate();
 }
 
 int16_t *ht_get_channels() {
@@ -476,6 +523,7 @@ void head_alarm_init() {
 }
 
 void *head_alarm_thread(void *arg) {
+    perf_thread_name("halarm");
     while (1) {
         bool sounding_alarm = false;
         if (ht_data.enable && (g_setting.ht.alarm_state != SETTING_HT_ALARM_STATE_OFF)) {                                                                                                             // user settings

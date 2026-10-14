@@ -21,6 +21,7 @@
 
 #include "core/app_state.h"
 #include "core/input_device_internal.h"
+#include "core/perf_monitor.h"
 #include "core/settings.h"
 #include "driver/beep.h"
 
@@ -220,6 +221,7 @@ void input_backend_init(void) {
 
 void *input_backend_thread(void *ptr) {
     (void)ptr;
+    perf_thread_name("input");
     for (;;) {
         struct epoll_event events[EPOLL_FD_CNT];
 
