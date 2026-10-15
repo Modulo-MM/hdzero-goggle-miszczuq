@@ -1,11 +1,13 @@
 #include "core/boot_timing.h"
 
+#include <dirent.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,7 +31,7 @@
 #define BOOT_TIMING_SHELL_LOG "/tmp/boot_timing_sh.log"
 #define BOOT_TIMING_MAX_MARKS 192
 #define BOOT_TIMING_SETTLE_S  3  // keep marking this long after the first signal
-#define BOOT_TIMING_TIMEOUT_S 60 // write the report even if no signal shows up
+#define BOOT_TIMING_TIMEOUT_S 20 // write the report even if no signal shows up
 #define BOOT_TIMING_MAX_BYTES (2 * 1024 * 1024)
 #define BOOT_TIMING_TAG_LEN   48
 #define BOOT_OPT_DIR          "bootopt"
@@ -291,6 +293,273 @@ void boot_timing_signal(bool is_valid, int source) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// Vendor init timeline
+//
+// The vendor's boot scripts (/etc/init.d, before rc.sh) leave no timing of
+// their own. Without touching them, two things date their steps: the change
+// times of files they create (tmpfs/devtmpfs/configfs, wall clock: converted
+// with the wall-to-boot-clock offset taken at main() start, before the app
+// ever sets the clock) and the start times of the processes they leave
+// running (/proc/<pid>/stat, boot clock).
+
+typedef struct {
+    const char *path;
+    const char *what;
+    double t; // s since kernel start, < 0 = not found
+} init_marker_t;
+
+static void report_cmd(FILE *out, const char *cmd);
+
+static init_marker_t init_markers[] = {
+    {"/dev/by-name", "by-name links (mdev -s / preinit)", -1},
+    {"/tmp/.preinitdone", "preinit: overlay mounted, root switched", -1},
+    {"/dev/shm", "inittab sysinit: mkdir /dev/shm (before rcS)", -1},
+    {"/var/lock", "rc.preboot: mkdir /var/lock (after the /mnt/app mount)", -1},
+    {"/dev/mtd_name", "S00part: mtd_name links, last one", -1},
+    {"/tmp/event", "S01app: mkdir /tmp/event", -1},
+    {"/run/udev/control", "S10udev: udevd control socket", -1},
+    {"/run/udev/data", "S10udev: newest device db entry (trigger/settle)", -1},
+    {"/dev/pts/ptmx", "S11dev: devpts mounted", -1},
+    {"/run/network/ifstate", "S40network: ifup -a done", -1},
+    {"/sys/kernel/config/usb_gadget/g1", "S50usb: gadget g1, last change", -1},
+    {"/dev/usb-ffs", "S50usb: mkdir /dev/usb-ffs(/adb)", -1},
+    {"/dev/usb-ffs/adb/ep0", "S50usb: functionfs mounted", -1},
+    {"/dev/usb-ffs/adb/ep1", "S50usb: adbd endpoints ready", -1},
+};
+static bool init_markers_taken = false;
+
+// udev's device database: one file per device it has processed, written
+// when the event is done -- the pace of the coldplug in S10udev.
+#define UDEV_DB_MAX 1024
+typedef struct {
+    double t;
+    char name[40];
+} udev_db_entry_t;
+static udev_db_entry_t udev_db[UDEV_DB_MAX];
+static int udev_db_count = 0;
+
+static int udev_db_compare(const void *a, const void *b) {
+    const udev_db_entry_t *ea = a, *eb = b;
+    return (ea->t > eb->t) - (ea->t < eb->t);
+}
+
+void boot_timing_capture_init(void) {
+#if defined(__linux__)
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", path_extsd(), BOOT_TIMING_FILE);
+    if (!fs_file_exists(path))
+        return;
+
+    struct timespec rt, bt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+#ifdef CLOCK_BOOTTIME
+    clock_gettime(CLOCK_BOOTTIME, &bt);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &bt);
+#endif
+    double offset = (rt.tv_sec - bt.tv_sec) + (rt.tv_nsec - bt.tv_nsec) / 1e9;
+    double up = bt.tv_sec + bt.tv_nsec / 1e9;
+
+    for (unsigned i = 0; i < sizeof(init_markers) / sizeof(init_markers[0]); i++) {
+        init_marker_t *m = &init_markers[i];
+        struct stat st;
+        double t = -1;
+        if (strcmp(m->path, "/run/udev/data") == 0) {
+            // the newest entry in the directory
+            DIR *dir = opendir(m->path);
+            if (dir) {
+                struct dirent *de;
+                char entry[512];
+                while ((de = readdir(dir)) != NULL) {
+                    if (de->d_name[0] == '.')
+                        continue;
+                    snprintf(entry, sizeof(entry), "%s/%s", m->path, de->d_name);
+                    if (lstat(entry, &st) == 0) {
+                        double e = st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9 - offset;
+                        if (e > t)
+                            t = e;
+                        if (e >= 0 && e <= up && udev_db_count < UDEV_DB_MAX) {
+                            udev_db[udev_db_count].t = e;
+                            snprintf(udev_db[udev_db_count].name, sizeof(udev_db[0].name), "%s", de->d_name);
+                            udev_db_count++;
+                        }
+                    }
+                }
+                closedir(dir);
+            }
+        } else if (lstat(m->path, &st) == 0) {
+            t = st.st_mtim.tv_sec + st.st_mtim.tv_nsec / 1e9 - offset;
+        }
+        // Only what happened during this boot (files kept on flash or
+        // created before the clock was set read as long ago).
+        m->t = (t >= 0 && t <= up) ? t : -1;
+    }
+    qsort(udev_db, udev_db_count, sizeof(udev_db[0]), udev_db_compare);
+    init_markers_taken = true;
+#endif
+}
+
+static void report_udev_db(FILE *out) {
+    if (udev_db_count == 0)
+        return;
+    const double bin = 0.2;
+    double first = udev_db[0].t, last = udev_db[udev_db_count - 1].t;
+    fprintf(out, "-- udev db: %d entries this boot, %.3f .. %.3f s; entries per %.1f s from %.1f s: --\n", udev_db_count,
+            first, last, bin, first);
+    int bins = (int)((last - first) / bin) + 1;
+    if (bins > 100)
+        bins = 100;
+    for (int b = 0; b < bins; b++) {
+        int c = 0;
+        for (int i = 0; i < udev_db_count; i++) {
+            int k = (int)((udev_db[i].t - first) / bin);
+            if (k == b)
+                c++;
+        }
+        fprintf(out, "%s%d", b ? " " : "", c);
+    }
+    fprintf(out, "\n");
+    // the longest waits between two entries, and the entry that ended each
+    int top[8], ntop = 0;
+    for (int i = 1; i < udev_db_count; i++) {
+        double gap = udev_db[i].t - udev_db[i - 1].t;
+        int pos = ntop;
+        while (pos > 0 && gap > udev_db[top[pos - 1]].t - udev_db[top[pos - 1] - 1].t)
+            pos--;
+        if (pos >= 8)
+            continue;
+        if (ntop < 8)
+            ntop++;
+        for (int j = ntop - 1; j > pos; j--)
+            top[j] = top[j - 1];
+        top[pos] = i;
+    }
+    for (int j = 0; j < ntop; j++) {
+        int i = top[j];
+        fprintf(out, "  gap %.3f s: %.3f %s -> %.3f %s\n", udev_db[i].t - udev_db[i - 1].t, udev_db[i - 1].t,
+                udev_db[i - 1].name, udev_db[i].t, udev_db[i].name);
+    }
+}
+
+typedef struct {
+    double t;
+    int pid;
+    char text[96];
+} init_proc_t;
+
+static int init_proc_compare(const void *a, const void *b) {
+    const init_proc_t *pa = a, *pb = b;
+    return (pa->t > pb->t) - (pa->t < pb->t);
+}
+
+static void report_init_timeline(FILE *out) {
+    fprintf(out, "-- vendor init: s since kernel start (file change times / process starts) --\n");
+    if (init_markers_taken) {
+        for (unsigned i = 0; i < sizeof(init_markers) / sizeof(init_markers[0]); i++) {
+            if (init_markers[i].t >= 0)
+                fprintf(out, "%9.3f  file  %s (%s)\n", init_markers[i].t, init_markers[i].what, init_markers[i].path);
+            else
+                fprintf(out, "      -    file  %s (%s): none this boot\n", init_markers[i].what, init_markers[i].path);
+        }
+    }
+
+    static init_proc_t procs[256];
+    int n = 0;
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0)
+        hz = 100;
+    DIR *dir = opendir("/proc");
+    if (dir) {
+        struct dirent *de;
+        while ((de = readdir(dir)) != NULL && n < (int)(sizeof(procs) / sizeof(procs[0]))) {
+            int pid = atoi(de->d_name);
+            if (pid <= 0)
+                continue;
+            char path[64], line[512], cmd[256];
+            snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+            FILE *fp = fopen(path, "r");
+            if (!fp)
+                continue;
+            size_t len = fread(cmd, 1, sizeof(cmd) - 1, fp);
+            fclose(fp);
+            for (size_t i = 0; i < len; i++) {
+                if (cmd[i] == 0)
+                    cmd[i] = ' ';
+            }
+            cmd[len] = 0;
+
+            snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+            fp = fopen(path, "r");
+            if (!fp)
+                continue;
+            bool ok = fgets(line, sizeof(line), fp) != NULL;
+            fclose(fp);
+            char *open = ok ? strchr(line, '(') : NULL;
+            char *close = ok ? strrchr(line, ')') : NULL;
+            unsigned long long start;
+            // after "(comm) ": state ppid ... starttime is field 22
+            if (!open || !close || close < open ||
+                sscanf(close + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu",
+                       &start) != 1)
+                continue;
+            if (len == 0) {
+                // Kernel thread: only the ones started by the boot scripts,
+                // e.g. jffs2_gcd_mtdN, which a JFFS2 mount starts once its
+                // scan of the partition is done.
+                *close = 0;
+                if ((double)start / hz < 1.0 || strncmp(open + 1, "kworker", 7) == 0)
+                    continue;
+                snprintf(cmd, sizeof(cmd), "[%s]", open + 1);
+            }
+            procs[n].t = (double)start / hz;
+            procs[n].pid = pid;
+            snprintf(procs[n].text, sizeof(procs[n].text), "%s", cmd);
+            n++;
+        }
+        closedir(dir);
+    }
+    qsort(procs, n, sizeof(procs[0]), init_proc_compare);
+    for (int i = 0; i < n; i++)
+        fprintf(out, "%9.3f  proc  %5d %s\n", procs[i].t, procs[i].pid, procs[i].text);
+    report_udev_db(out);
+}
+
+// Once per card (and again when this list changes: the first line holds its
+// version): the vendor boot scripts in full (the report only quotes the start
+// of each), into BOOT_INIT_SCRIPTS.log next to BOOT_TIMING.log.
+#define INIT_SCRIPTS_VERSION "# BOOT_INIT_SCRIPTS v3"
+static void report_init_scripts_once(void) {
+    char path[256], first[64] = "";
+    snprintf(path, sizeof(path), "%s/BOOT_INIT_SCRIPTS.log", path_extsd());
+    FILE *in = fopen(path, "r");
+    if (in) {
+        bool current = fgets(first, sizeof(first), in) && strncmp(first, INIT_SCRIPTS_VERSION, strlen(INIT_SCRIPTS_VERSION)) == 0;
+        fclose(in);
+        if (current)
+            return;
+    }
+    FILE *out = fopen(path, "w");
+    if (!out)
+        return;
+    fprintf(out, "%s\n", INIT_SCRIPTS_VERSION);
+    report_cmd(out, "for f in /pseudo_init /etc/inittab /etc/preinit /etc/fstab /etc/init.d/* "
+                    "/etc/network/interfaces /etc/mdev.conf /etc/udev/udev.conf /etc/udev/rules.d/* "
+                    "/lib/udev/rules.d/50-udev-default.rules /lib/udev/rules.d/60-block.rules "
+                    "/lib/udev/rules.d/60-persistent-storage.rules /lib/udev/rules.d/78-sound-card.rules "
+                    "/usr/bin/hotplug.sh /sbin/hotplug.sh; do "
+                    "[ -f \"$f\" ] && { echo \"########## $f\"; cat \"$f\"; }; done");
+    report_cmd(out, "ls -la /etc/init.d /etc/udev/rules.d /lib/udev/rules.d /etc/rc.d /usr/bin/hotplug.sh 2>&1");
+    report_cmd(out, "ls -la / /var 2>&1");
+    report_cmd(out, "ls -la /bin/sh /bin/busybox /usr/bin/awk");
+    report_cmd(out, "grep -v nodev /proc/filesystems");
+    report_cmd(out, "find /sys/devices -name uevent | wc -l");
+    report_cmd(out, "cat /proc/mounts");
+    fflush(out);
+    fsync(fileno(out));
+    fclose(out);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Report
 
 typedef struct {
@@ -321,8 +590,11 @@ static void report_file(FILE *out, const char *path) {
 
 static void report_cmd(FILE *out, const char *cmd) {
     fprintf(out, "$ %s\n", cmd);
-    char full[256];
-    snprintf(full, sizeof(full), "%s 2>&1", cmd);
+    char full[1024];
+    if (snprintf(full, sizeof(full), "%s 2>&1", cmd) >= (int)sizeof(full)) {
+        fprintf(out, "(command too long)\n");
+        return;
+    }
     FILE *in = popen(full, "r");
     if (!in) {
         fprintf(out, "(popen failed)\n");
@@ -421,6 +693,8 @@ static void report_write(const char *path) {
         fprintf(out, "first valid signal: none within %d s of app init\n", BOOT_TIMING_TIMEOUT_S);
 
     report_timeline(out);
+    report_init_timeline(out);
+    report_init_scripts_once();
 
     fprintf(out, "-- system --\n");
     report_file(out, "/proc/uptime");

@@ -34,6 +34,7 @@ SDL_mutex *global_sdl_mutex;
 #include "core/sleep_mode.h"
 #include "core/thread.h"
 #include "platform/paths.h"
+#include "player/lazy/player_lazy.h"
 #include "driver/beep.h"
 #include "driver/dm5680.h"
 #include "driver/esp32.h"
@@ -331,11 +332,16 @@ int main(int argc, char *argv[]) {
     // Resolve emulator filesystem roots before settings/resources are read.
     // On hardware this keeps the compiled-in /mnt/app and /mnt/extsd paths.
     paths_init();
+    boot_timing_capture_init();
 
     // 1. Recall configuration
     settings_init();
     settings_load();
     perf_opts_init();
+    if (boot_opt("disable_lazy_player")) {
+        player_load_now(); // the old boot-time loading, for comparison
+        boot_mark("player_loaded");
+    }
 #ifdef HDZGOGGLE2
     HDZero_restore_cam_mode(); // the last HDZero camera mode, for the first Display_* call
 #endif
@@ -493,6 +499,7 @@ int main(int argc, char *argv[]) {
     close(open("/tmp/app_init_done", O_WRONLY | O_CREAT, 0644));
     boot_timing_start();
     perf_monitor_start();
+    player_preload_start();
     bool first_loop_done = false;
 
 #ifdef EMULATOR_BUILD

@@ -117,6 +117,7 @@ function config_uart_vdpo()
 		: > /tmp/vdpo_pending
 		(
 			dispw -x
+			bt vdpo_x
 			dispw -s vdpo $mode
 			rm -f /tmp/vdpo_pending
 			bt vdpo_set_$mode
@@ -257,12 +258,17 @@ elif [ $PLATFORM == "HDZGOGGLE2" ]; then
 	/mnt/app/script/system_daemon.sh &
 fi
 
-# /etc/init.d/S50usb must stay the vendor original. A test build (boottiming3)
-# backgrounded its start() via the rootfs overlay to skip its "sleep 2"; that
-# let the USB driver load race this script's first I2C accesses (mcp3021
-# insmod) and the i2c1 bus hung for the whole boot (xfer timeouts, app stuck).
-# Undo that edit wherever it is still present: copy the read-only original
-# back over the overlay copy (mv over it, never rm: that leaves a whiteout).
+# /etc/init.d/S50usb must stay the vendor original (read-only copy in
+# /squashfs). It loads the USB drivers, starts adbd and sleeps a fixed 2 s
+# before binding the gadget, and that sleep is what keeps i2c1 safe: the USB
+# drivers keep working for a while after their insmod, and an i2c1 access in
+# that window hangs the bus for the whole boot (xfer timeouts, app never up).
+# Two test builds cut the wait through the rootfs overlay and both hit it on
+# the first boot this script reached its sensor insmods (mcp3021) early:
+# boottiming3 (start() backgrounded) and perf10 (insmods kept in order, only
+# the sleep skipped). Undo such an edit wherever it is still present: copy the
+# original back over the overlay copy (mv over it, never rm: that leaves a
+# whiteout).
 S50USB=/etc/init.d/S50usb
 S50USB_ORIG=/squashfs/etc/init.d/S50usb
 function s50usb_heal()
@@ -274,6 +280,45 @@ function s50usb_heal()
 	rm -f $S50USB.tmp
 }
 
+# Boot experiment (G2, opt-in: <SD>/bootopt/udev_settle_bg). The vendor
+# /etc/init.d/S10udev waits for udev to finish its coldplug ("udevadm settle"),
+# and on every measured boot that wait ends ~1.06 s after the last coldplug
+# event, the SD card's, whose rule runs the vendor /usr/bin/udev_handler; every
+# later init script and this one wait for it. S10udev.bg runs that wait in the
+# background. Installed on the rootfs overlay (takes effect from the
+# next boot) only over the exact original (S10udev.vendor), and only after a
+# boot where the app came up. Without the flag the original goes back. If the
+# app did not come up on a boot that ran the edited script, the original goes
+# back and the flag is renamed to udev_settle_bg.failed.
+S10UDEV=/etc/init.d/S10udev
+S10UDEV_ORIG=/squashfs/etc/init.d/S10udev
+S10UDEV_BG=/mnt/app/script/S10udev.bg
+S10UDEV_FLAG=/mnt/extsd/bootopt/udev_settle_bg
+function s10udev_update()
+{
+	local want=$S10UDEV_ORIG
+	[ $PLATFORM == "HDZGOGGLE2" ] && [ -f $S10UDEV_ORIG ] && [ -f $S10UDEV_BG ] || return
+	if cmp -s $S10UDEV_BG $S10UDEV; then
+		bt s10udev_bg_active
+		if [ ! -e /tmp/app_init_done ] && [ -e $S10UDEV_FLAG ]; then
+			echo "set by rc.sh: the app was not up ~30 s after rc.sh started, with the edited S10udev; uptime $(cat /proc/uptime)" \
+				> $S10UDEV_FLAG.failed
+			rm -f $S10UDEV_FLAG
+		fi
+	fi
+	if [ -e $S10UDEV_FLAG ] && [ -e /tmp/app_init_done ]; then
+		if cmp -s $S10UDEV_ORIG /mnt/app/script/S10udev.vendor; then
+			want=$S10UDEV_BG
+		else
+			bt s10udev_vendor_script_differs
+		fi
+	fi
+	cmp -s $want $S10UDEV && return
+	cat $want > $S10UDEV.tmp && chmod 755 $S10UDEV.tmp &&
+		mv $S10UDEV.tmp $S10UDEV && sync && bt s10udev_installed_${want##*/}
+	rm -f $S10UDEV.tmp
+}
+
 # Deferred work: start it once the app has finished its bring-up (the app
 # creates /tmp/app_init_done), so it doesn't compete with it; at most ~30 s.
 (
@@ -283,6 +328,9 @@ function s50usb_heal()
 		i=$((i + 1))
 	done
 	bt deferred_start
+
+	# early, so its marks make it into this boot's BOOT_TIMING.log report
+	s10udev_update
 
 	# Boot without an SD card: keep a snapshot on the internal UDISK
 	# partition; the next boot with a card moves it to BOOT_NOSD.log there.

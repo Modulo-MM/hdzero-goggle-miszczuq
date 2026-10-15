@@ -1,0 +1,12 @@
+/* App symbols that libhdzplayer.so uses (src/player/lazy/player_lazy.c),
+   log_printf from the log library linked into the app:
+   exported from the app binary with --dynamic-list. */
+{
+    Display_Playback;
+    Display_UI;
+    dvr_mute_live_audio;
+    dvr_restore_live_audio;
+    dvr_set_dvr_audio_volume;
+    g_setting;
+    log_printf;
+};

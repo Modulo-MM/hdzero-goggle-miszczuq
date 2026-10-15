@@ -22,6 +22,10 @@ void boot_timing_signal(bool is_valid, int source);
 // Call once boot is done: starts the background report writer if enabled.
 void boot_timing_start(void);
 
+// Call first thing in main() (after paths_init(), before the app sets the
+// clock): dates the vendor boot scripts' steps for the report.
+void boot_timing_capture_init(void);
+
 // Experimental boot optimizations under test are opt-in per SD card flag
 // file: true if <SD>/bootopt/<name> exists. Results are cached and listed in
 // the report, so every report says which variant was measured.

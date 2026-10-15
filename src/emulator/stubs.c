@@ -36,3 +36,5 @@ void Display_720P60_50(int mode, uint8_t is_43) {}
 void Display_1080P30(int mode) {}
 void Display_1080P24(int mode) {}
 #endif
+void player_preload_start(void) {}
+void player_load_now(void) {}

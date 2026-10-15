@@ -159,7 +159,8 @@ set(SRC_FILES
 if(EMULATOR_BUILD)
 	list(APPEND SRC_FILES ${SRC_FILES_EMULATOR})
 else()
-	list(APPEND SRC_FILES ${SRC_FILES_PLAYER})
+	# The DVR player is libhdzplayer.so (below), loaded on first use.
+	list(APPEND SRC_FILES src/player/lazy/player_lazy.c)
 endif()
 
 add_executable(${PROJECT_NAME} ${SRC_FILES})
@@ -184,6 +185,43 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 	esp-loader
 	softwinner
 )
+
+if(NOT EMULATOR_BUILD)
+	# DVR player as a library the app loads on first use
+	# (src/player/lazy/player_lazy.c): it needs ~40 vendor media libraries
+	# that the boot no longer has to load. --as-needed keeps the app's
+	# NEEDED list to what the app itself uses (softwinner stays linked for
+	# its include directories); the app exports to the player the few
+	# symbols it uses.
+	add_library(hdzplayer SHARED ${SRC_FILES_PLAYER})
+	target_include_directories(hdzplayer PRIVATE
+		src/
+		src/core
+		src/driver
+		src/player
+		src/player/media/app
+		src/window
+
+		lib/linux/include
+		lib/linux/include/video
+		$<TARGET_PROPERTY:lvgl,INTERFACE_INCLUDE_DIRECTORIES>
+		$<TARGET_PROPERTY:minIni,INTERFACE_INCLUDE_DIRECTORIES>
+		$<TARGET_PROPERTY:log,INTERFACE_INCLUDE_DIRECTORIES>
+	)
+	target_compile_definitions(hdzplayer PRIVATE
+		$<TARGET_PROPERTY:lvgl,INTERFACE_COMPILE_DEFINITIONS>
+	)
+	target_link_libraries(hdzplayer PRIVATE
+		${STANDARD_LIBRARIES}
+		softwinner
+	)
+	target_link_options(${PROJECT_NAME} PRIVATE
+		-Wl,--as-needed
+		-Wl,--dynamic-list=${CMAKE_CURRENT_SOURCE_DIR}/src/player/lazy/exports.list
+	)
+	set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY
+		LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/player/lazy/exports.list)
+endif()
 
 if(EMULATOR_BUILD)
 	# SDL2_INCLUDE_DIRS carries both <prefix>/include and <prefix>/include/SDL2, so
@@ -294,10 +332,11 @@ if(NOT EMULATOR_BUILD)
 		COMMAND cp record ${CMAKE_CURRENT_BINARY_DIR}/out/
 		COMMAND cp rtspLive ${CMAKE_CURRENT_BINARY_DIR}/out/
 		COMMAND cp ${PROJECT_NAME} ${OS_APP_PATH}
+		COMMAND cp libhdzplayer.so ${OS_APP_PATH}
 		COMMAND cp record ${RECORD_APP_PATH}
 		COMMAND cp rtspLive ${RECORD_APP_PATH}
 		COMMAND cd ${CMAKE_CURRENT_BINARY_DIR} && ./mkapp/mkapp_ota.sh
-		DEPENDS MKAPP ${PROJECT_NAME} record rtspLive
+		DEPENDS MKAPP ${PROJECT_NAME} hdzplayer record rtspLive
 	)
 	add_custom_target(${PROJECT_NAME}-OTA ALL
 		DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/out/${PROJECT_NAME}
