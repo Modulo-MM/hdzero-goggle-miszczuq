@@ -1,0 +1,9 @@
+#!/bin/sh
+# HDZero: full CPU speed for the boot; see cpu_boost_update in rc.sh, which
+# installs this file and goes back to ondemand once the app is up.
+
+case "$1" in
+    start)
+        echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+        ;;
+esac

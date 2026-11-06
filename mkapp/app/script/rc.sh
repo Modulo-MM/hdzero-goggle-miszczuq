@@ -23,6 +23,23 @@ function sd_mounted()
 	return 1
 }
 
+# Boot experiment (G2, opt-in: <SD>/bootopt/sd_mount_bg): S01app.bg mounts the
+# SD card in the background while the later init scripts run, 0.4-0.5 s in the
+# foreground otherwise. Everything below looks at the card, so wait for it
+# here; capped, a card that takes longer is treated as not there for this boot.
+function wait_sd_mount()
+{
+	local i=0
+	[ -e /tmp/sd_mount_pending ] || [ -e /tmp/sd_mount_marks ] || return
+	while [ -e /tmp/sd_mount_pending ] && [ $i -lt 150 ]; do
+		usleep 20000
+		i=$((i + 1))
+	done
+	cat /tmp/sd_mount_marks >> $BOOT_TIMING_SH_LOG 2>/dev/null
+	bt sd_mount_ready
+}
+wait_sd_mount
+
 # Kernel log as of now, before the display driver's chatter overwrites the
 # early boot in the small ring buffer: while boot timing is enabled, and on
 # boots without an SD card (see BOOT_NOSD.log below).
@@ -52,6 +69,31 @@ function reg_snap()
 	read up rest < /proc/uptime
 	line="$up $1"
 	for r in 0x0300B098 0x0300B0FC 0x0300B100 0x0300191C; do
+		reg_read $r
+		line="$line $r=$REG_VAL"
+	done
+	echo "$line" >> $REG_SNAP
+}
+
+# About one boot in four runs every step ~1.3-1.6 times faster than the rest,
+# for no known reason. CPU frequency history and the CCU's PLL_CPUX, PLL_DDR0,
+# PLL_PERI0, CPUX_AXI, PSI_AHB, MBUS, DRAM_CLK, SMHC0_CLK and SPI0_CLK, while
+# boot timing is enabled, to compare the two kinds of boot.
+function cpu_snap()
+{
+	local up rest a b gov cur online r line
+	local f=/sys/devices/system/cpu/cpu0/cpufreq
+	[ -e /mnt/extsd/BOOT_TIMING.log ] || return
+	read up rest < /proc/uptime
+	read gov < $f/scaling_governor
+	read cur < $f/scaling_cur_freq
+	read online < /sys/devices/system/cpu/online
+	line="$up cpu_$1 gov=$gov cur=$cur online=$online"
+	while read a b; do
+		line="$line $a:$b"
+	done < $f/stats/time_in_state
+	for r in 0x03001000 0x03001010 0x03001020 0x03001500 0x03001510 \
+		0x03001540 0x03001800 0x03001830 0x03001940; do
 		reg_read $r
 		line="$line $r=$REG_VAL"
 	done
@@ -356,6 +398,7 @@ echo "0 4 1 7">/proc/sys/kernel/printk
 #give hwclock a mode it can survive (see seed_adjtime)
 seed_adjtime
 
+cpu_snap rc_start
 reg_snap before_setup_uart
 
 #config UART and VDPO
@@ -426,63 +469,93 @@ elif [ $PLATFORM == "HDZGOGGLE2" ]; then
 	/mnt/app/script/system_daemon.sh &
 fi
 
-# /etc/init.d/S50usb stays the vendor original (read-only copy in /squashfs).
-# It loads the USB drivers, starts adbd and sleeps a fixed 2 s before binding
-# the gadget. Two test builds cut that wait through the rootfs overlay,
-# boottiming3 (start() backgrounded) and perf10 (only the sleep skipped), and
-# both hung i2c1 on the first boot this script started early (see
-# setup_uart). S50usb stays unchanged. Undo such an edit wherever it is still
-# present: copy the
-# original back over the overlay copy (mv over it, never rm: that leaves a
-# whiteout).
-S50USB=/etc/init.d/S50usb
-S50USB_ORIG=/squashfs/etc/init.d/S50usb
-function s50usb_heal()
+# Boot experiments on the vendor init scripts (G2, opt-in by a file in
+# <SD>/bootopt):
+# - udev_settle_bg, S10udev.bg: "udevadm settle" in the background. It waited
+#   ~1.06 s after the last coldplug event on every boot, the vendor
+#   /usr/bin/udev_handler retrying the mount of the already mounted SD card.
+# - s50usb_bg, S50usb.bg: the fixed 2 s sleep after starting adbd and the USB
+#   gadget bind in the background. The bind fails (-19) on every boot and
+#   nothing here uses the gadget.
+# - sd_mount_bg, S01app.bg: the SD card mount in the background (wait_sd_mount).
+# Installed on the rootfs overlay (takes effect from the next boot) only over
+# the exact original (<script>.vendor), and only after a boot where the app came
+# up. Without the flag the original goes back: copied over the overlay copy, mv
+# over it, never rm, that leaves a whiteout. If the app did not come up on a
+# boot that ran the edited script, the original goes back and the flag is
+# renamed to <flag>.failed.
+function overlay_script_update()
 {
-	[ -f $S50USB_ORIG ] || return
-	cmp -s $S50USB_ORIG $S50USB && return
-	cat $S50USB_ORIG > $S50USB.tmp && chmod 755 $S50USB.tmp &&
-		mv $S50USB.tmp $S50USB && sync && bt s50usb_restored
-	rm -f $S50USB.tmp
+	local script=/etc/init.d/$1 orig=/squashfs/etc/init.d/$1
+	local bg=/mnt/app/script/$1.bg flag=/mnt/extsd/bootopt/$3
+	local want=$orig
+	[ -f $orig ] || return
+	if [ $PLATFORM == "HDZGOGGLE2" ] && [ -f $bg ]; then
+		if cmp -s $bg $script; then
+			bt $2_bg_active
+			if [ ! -e /tmp/app_init_done ] && [ -e $flag ]; then
+				echo "set by rc.sh: the app was not up ~30 s after rc.sh started, with the edited $1; uptime $(cat /proc/uptime)" \
+					> $flag.failed
+				rm -f $flag
+			fi
+		fi
+		if [ -e $flag ] && [ -e /tmp/app_init_done ]; then
+			if cmp -s $orig /mnt/app/script/$1.vendor; then
+				want=$bg
+			else
+				bt $2_vendor_script_differs
+			fi
+		fi
+	fi
+	cmp -s $want $script && return
+	cat $want > $script.tmp && chmod 755 $script.tmp &&
+		mv $script.tmp $script && sync && bt $2_installed_${want##*/}
+	rm -f $script.tmp
 }
 
-# Boot experiment (G2, opt-in: <SD>/bootopt/udev_settle_bg). The vendor
-# /etc/init.d/S10udev waits for udev to finish its coldplug ("udevadm settle"),
-# and on every measured boot that wait ends ~1.06 s after the last coldplug
-# event, the SD card's, whose rule runs the vendor /usr/bin/udev_handler; every
-# later init script and this one wait for it. S10udev.bg runs that wait in the
-# background. Installed on the rootfs overlay (takes effect from the
-# next boot) only over the exact original (S10udev.vendor), and only after a
-# boot where the app came up. Without the flag the original goes back. If the
-# app did not come up on a boot that ran the edited script, the original goes
-# back and the flag is renamed to udev_settle_bg.failed.
-S10UDEV=/etc/init.d/S10udev
-S10UDEV_ORIG=/squashfs/etc/init.d/S10udev
-S10UDEV_BG=/mnt/app/script/S10udev.bg
-S10UDEV_FLAG=/mnt/extsd/bootopt/udev_settle_bg
-function s10udev_update()
+# Boot experiment (G2, opt-in: <SD>/bootopt/cpu_boost). ondemand samples the
+# load only every 2 s here (clock-latency 2 ms in the device tree, times 1000),
+# so one sample early on decides how the boot runs: about one boot in four gets
+# 1104 MHz for 2 s, the others stay at 816 MHz and take ~1.35 times as long; the
+# app then starts at ~940 MHz on average. S00cpuboost, the first init script,
+# sets the performance governor, and cpu_boost_end goes back to ondemand once
+# the app is up, or after ~30 s. 1104 MHz is the top step of the normal table.
+# A file of our own on the rootfs overlay, no vendor script changes. Installed
+# after a boot where the app came up, effective from the next boot. Without the
+# flag it goes; if the app did not come up on a boot that ran it, it goes and
+# the flag is renamed to cpu_boost.failed.
+CPU_BOOST=/etc/init.d/S00cpuboost
+CPU_BOOST_FLAG=/mnt/extsd/bootopt/cpu_boost
+function cpu_boost_update()
 {
-	local want=$S10UDEV_ORIG
-	[ $PLATFORM == "HDZGOGGLE2" ] && [ -f $S10UDEV_ORIG ] && [ -f $S10UDEV_BG ] || return
-	if cmp -s $S10UDEV_BG $S10UDEV; then
-		bt s10udev_bg_active
-		if [ ! -e /tmp/app_init_done ] && [ -e $S10UDEV_FLAG ]; then
-			echo "set by rc.sh: the app was not up ~30 s after rc.sh started, with the edited S10udev; uptime $(cat /proc/uptime)" \
-				> $S10UDEV_FLAG.failed
-			rm -f $S10UDEV_FLAG
+	[ $PLATFORM == "HDZGOGGLE2" ] && [ -f /mnt/app/script/S00cpuboost ] || return
+	if [ -e $CPU_BOOST ]; then
+		bt cpu_boost_active
+		if [ ! -e /tmp/app_init_done ] && [ -e $CPU_BOOST_FLAG ]; then
+			echo "set by rc.sh: the app was not up ~30 s after rc.sh started, with S00cpuboost; uptime $(cat /proc/uptime)" \
+				> $CPU_BOOST_FLAG.failed
+			rm -f $CPU_BOOST_FLAG
 		fi
 	fi
-	if [ -e $S10UDEV_FLAG ] && [ -e /tmp/app_init_done ]; then
-		if cmp -s $S10UDEV_ORIG /mnt/app/script/S10udev.vendor; then
-			want=$S10UDEV_BG
-		else
-			bt s10udev_vendor_script_differs
-		fi
+	if [ -e $CPU_BOOST_FLAG ] && [ -e /tmp/app_init_done ]; then
+		cmp -s /mnt/app/script/S00cpuboost $CPU_BOOST && return
+		cat /mnt/app/script/S00cpuboost > $CPU_BOOST.tmp && chmod 755 $CPU_BOOST.tmp &&
+			mv $CPU_BOOST.tmp $CPU_BOOST && sync && bt cpu_boost_installed
+		rm -f $CPU_BOOST.tmp
+	elif [ ! -e $CPU_BOOST_FLAG ] && [ -e $CPU_BOOST ]; then
+		rm -f $CPU_BOOST
+		sync
+		bt cpu_boost_removed
 	fi
-	cmp -s $want $S10UDEV && return
-	cat $want > $S10UDEV.tmp && chmod 755 $S10UDEV.tmp &&
-		mv $S10UDEV.tmp $S10UDEV && sync && bt s10udev_installed_${want##*/}
-	rm -f $S10UDEV.tmp
+}
+
+function cpu_boost_end()
+{
+	local f=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor gov
+	read gov < $f
+	[ "$gov" = performance ] || return
+	echo ondemand > $f
+	bt cpu_boost_end
 }
 
 # One-time copy of vendor files for offline analysis, while boot timing is
@@ -539,10 +612,15 @@ function vendor_dump_pins()
 		i=$((i + 1))
 	done
 	bt deferred_start
+	cpu_boost_end
 
 	# early, so its marks make it into this boot's BOOT_TIMING.log report
-	s10udev_update
+	overlay_script_update S10udev s10udev udev_settle_bg
+	overlay_script_update S50usb s50usb s50usb_bg
+	overlay_script_update S01app s01app sd_mount_bg
+	cpu_boost_update
 
+	cpu_snap app_up
 	if [ -e $REG_SNAP ] && sd_mounted; then
 		{ echo "===== boot"; cat $BOOT_TIMING_SH_LOG $REG_SNAP; } >> /mnt/extsd/REG_SNAP.log
 	fi
@@ -614,7 +692,6 @@ function vendor_dump_pins()
 		fi
 	fi
 
-	s50usb_heal
 	bt deferred_end
 
 	vendor_dump
